@@ -5,9 +5,15 @@ embedding_model:
   provider: "huggingface"
   model_name: "sentence-transformers/all-MiniLM-L6-v2"
 
+ingestion:
+  chunk_size: 400
+  chunk_overlap: 80
+  state_file: "data/.ingestion_state.json"
+  keyword_index_file: "data/.keyword_index.json"
+
 retriever:
   top_k: 10
 
 llm:
   provider: "groq"
-  model_name: "deepseek-r1-distill-llama-70b" 
+  model_name: "deepseek-r1-distill-llama-70b"
