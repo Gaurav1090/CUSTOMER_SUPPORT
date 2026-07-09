@@ -1,0 +1,55 @@
+name: RAG Evaluation CI
+
+on:
+  push:
+    branches: [main, develop, feature-*]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  evaluation:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run RAG evaluation tests
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          CHROMA_API_KEY: ${{ secrets.CHROMA_API_KEY }}
+          CHROMA_TENANT: ${{ secrets.CHROMA_TENANT }}
+          CHROMA_DATABASE: ${{ secrets.CHROMA_DATABASE }}
+        run: |
+          python -m unittest tests.test_phase4_evaluation tests.test_phase4_ci -v
+      
+      - name: Run full test suite
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          python -m unittest discover tests -p "test_phase*.py" -v
+      
+      - name: Generate evaluation report
+        if: always()
+        run: |
+          python evaluation/run_evaluation.py
+      
+      - name: Upload evaluation results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: evaluation-results-py${{ matrix.python-version }}
+          path: evaluation/results.json
