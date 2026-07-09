@@ -84,35 +84,62 @@
             $("#text").val("");
             $("#messageFormeight").append(userHtml);
 
-            $.ajax({
-                data: { msg: rawText },
-                type: "POST",
-                url: "/get",
-                headers: { "X-API-Key": apiKey },
-            }).done(function(data) {
-                var safeData = escapeHtml(data);
-                var botHtml = `
-                    <div class="d-flex justify-content-start mb-4">
-                        <div class="img_cont_msg">
-                            <img src="https://static.vecteezy.com/system/resources/previews/016/017/018/non_2x/ecommerce-icon-free-png.png" class="rounded-circle user_img_msg">
-                        </div>
-                        <div class="msg_cotainer">${safeData}
-                            <span class="msg_time">${str_time}</span>
-                        </div>
-                    </div>`;
-                $("#messageFormeight").append($.parseHTML(botHtml));
-                $("#messageFormeight").scrollTop($("#messageFormeight")[0].scrollHeight);
-            }).fail(function() {
-                var errorHtml = `
-                    <div class="d-flex justify-content-start mb-4">
-                        <div class="img_cont_msg">
-                            <img src="https://static.vecteezy.com/system/resources/previews/016/017/018/non_2x/ecommerce-icon-free-png.png" class="rounded-circle user_img_msg">
-                        </div>
-                        <div class="msg_cotainer">The assistant is unavailable right now. Please try again later.
-                            <span class="msg_time">${str_time}</span>
-                        </div>
-                    </div>`;
-                $("#messageFormeight").append($.parseHTML(errorHtml));
+            var botHtml = `
+                <div class="d-flex justify-content-start mb-4">
+                    <div class="img_cont_msg">
+                        <img src="https://static.vecteezy.com/system/resources/previews/016/017/018/non_2x/ecommerce-icon-free-png.png" class="rounded-circle user_img_msg">
+                    </div>
+                    <div class="msg_cotainer"><span class="streaming_response"></span>
+                        <span class="msg_time">${str_time}</span>
+                    </div>
+                </div>`;
+            var botNode = $($.parseHTML(botHtml));
+            var responseNode = botNode.find(".streaming_response");
+            $("#messageFormeight").append(botNode);
+
+            fetch("/get/stream", {
+                method: "POST",
+                headers: {
+                    "X-API-Key": apiKey,
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                body: new URLSearchParams({ msg: rawText })
+            }).then(async function(response) {
+                if (!response.ok || !response.body) {
+                    throw new Error("stream failed");
+                }
+
+                var reader = response.body.getReader();
+                var decoder = new TextDecoder();
+                var buffer = "";
+                while (true) {
+                    var result = await reader.read();
+                    if (result.done) {
+                        break;
+                    }
+                    buffer += decoder.decode(result.value, { stream: true });
+                    var events = buffer.split("\n\n");
+                    buffer = events.pop();
+
+                    events.forEach(function(eventText) {
+                        var eventName = "";
+                        var eventData = "";
+                        eventText.split("\n").forEach(function(line) {
+                            if (line.startsWith("event: ")) {
+                                eventName = line.slice(7);
+                            }
+                            if (line.startsWith("data: ")) {
+                                eventData += line.slice(6);
+                            }
+                        });
+                        if (eventName === "token") {
+                            responseNode.text(responseNode.text() + eventData);
+                            $("#messageFormeight").scrollTop($("#messageFormeight")[0].scrollHeight);
+                        }
+                    });
+                }
+            }).catch(function() {
+                responseNode.text("The assistant is unavailable right now. Please try again later.");
                 $("#messageFormeight").scrollTop($("#messageFormeight")[0].scrollHeight);
             });
 

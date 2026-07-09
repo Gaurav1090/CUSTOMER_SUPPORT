@@ -12,5 +12,7 @@ langchain-chroma
 chromadb
 langchain-huggingface
 sentence-transformers
+redis
+langfuse
 
 -e .

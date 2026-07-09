@@ -1,7 +1,10 @@
 import os
+import logging
 from typing import Optional
 
 from langchain_chroma import Chroma
+
+logger = logging.getLogger(__name__)
 
 
 def create_chroma_store(
@@ -55,7 +58,7 @@ def create_chroma_store(
             )
         except Exception as exc:
             if _should_fallback_to_local(exc):
-                print("Cloud Chroma connection failed; falling back to local persistence.")
+                logger.warning("Cloud Chroma connection failed; falling back to local persistence.")
             else:
                 raise
 
@@ -69,4 +72,4 @@ def create_chroma_store(
 
 def _should_fallback_to_local(exc: Exception) -> bool:
     message = str(exc).lower()
-    return any(token in message for token in ["quota", "rate limit", "forbidden", "unauthorized", "timeout", "connection", "not found", "not available", "403", "401", "404", "500"])
+    return any(token in message for token in ["quota", "rate limit", "forbidden", "unauthorized", "timeout", "connect", "connection", "not found", "not available", "403", "401", "404", "500"])

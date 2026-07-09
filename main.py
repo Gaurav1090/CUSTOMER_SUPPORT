@@ -2,11 +2,13 @@ import logging
 import os
 import re
 import secrets
+import time
 from collections import defaultdict
 
+import anyio
 import uvicorn
 from fastapi import FastAPI, Form, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -19,6 +21,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from retriever.retrieval import Retriever
 
 from utils.model_loader import ModelLoader
+from utils.ops import RateLimiter, RequestTrace, ResponseCache, build_langfuse_trace, new_request_id
 
 from prompt_library.prompt import PROMPT_TEMPLATES
 
@@ -56,13 +59,18 @@ app_api_key = os.getenv("APP_API_KEY")
 retriever_obj = Retriever()
 
 model_loader = ModelLoader()
+response_cache = ResponseCache()
+rate_limiter = RateLimiter()
 
 session_histories = defaultdict(list)
 
 
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
-    protected_paths = {"/get"}
+    request_id = request.headers.get("X-Request-Id", new_request_id())
+    request.state.request_id = request_id
+
+    protected_paths = {"/get", "/get/stream"}
     if request.url.path in protected_paths and request.method != "OPTIONS":
         if not app_api_key:
             logger.error("APP_API_KEY is not configured.")
@@ -78,7 +86,16 @@ async def api_key_middleware(request: Request, call_next):
                 status_code=status.HTTP_401_UNAUTHORIZED,
             )
 
-    return await call_next(request)
+        identity = request_api_key or (request.client.host if request.client else "unknown")
+        if not rate_limiter.allow(identity):
+            return PlainTextResponse(
+                "Rate limit exceeded. Please slow down and try again shortly.",
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+    response = await call_next(request)
+    response.headers["X-Request-Id"] = request_id
+    return response
 
 
 def strip_reasoning_tokens(output: str) -> str:
@@ -102,18 +119,61 @@ def _judge_groundedness(context: str, answer: str) -> bool:
     return verdict == "YES"
 
 
-def invoke_chain(query: str, session_id: str = "default"):
+def _build_context_text(retrieved_documents):
+    return "\n\n".join(
+        f"- {doc.page_content} [source:{doc.metadata.get('source_id', 'unknown')}]" for doc in retrieved_documents
+    )
+
+
+def _source_ids(retrieved_documents):
+    return [doc.metadata.get("source_id", "unknown") for doc in retrieved_documents]
+
+
+def _embed_query(query: str):
     try:
+        return model_loader.load_embeddings().embed_query(query)
+    except Exception:
+        logger.exception("Failed to embed query for semantic cache.")
+        return None
+
+
+def invoke_chain_details(query: str, session_id: str = "default", request_id: str = None):
+    request_id = request_id or new_request_id()
+    trace = RequestTrace(request_id=request_id, question=query, session_id=session_id)
+    langfuse_trace = build_langfuse_trace(trace)
+
+    try:
+        query_embedding = _embed_query(query)
+        cached = response_cache.get_exact(query, session_id)
+        if not cached and query_embedding:
+            cached = response_cache.get_semantic(query_embedding, session_id)
+        if cached:
+            trace.add("cache_hit", cached.hit_type)
+            trace.finish("ok")
+            if langfuse_trace:
+                langfuse_trace.update(output={"answer": cached.answer, "cache_hit": cached.hit_type})
+            session_histories[session_id].append({"user": query, "assistant": cached.answer})
+            return {
+                "answer": cached.answer,
+                "cache_hit": cached.hit_type,
+                "retrieved_documents": [],
+                "request_id": request_id,
+            }
+
+        retrieval_start = time.time()
         retrieved_documents = retriever_obj.call_retriever(query)
-        context_text = "\n\n".join(
-            f"- {doc.page_content} [source:{doc.metadata.get('source_id', 'unknown')}]" for doc in retrieved_documents
-        )
+        trace.add("retrieval_latency_ms", int((time.time() - retrieval_start) * 1000))
+        trace.add("retrieved_source_ids", _source_ids(retrieved_documents))
+
+        context_text = _build_context_text(retrieved_documents)
         chat_history = _build_chat_history(session_id)
         prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATES["product_bot"])
         llm = model_loader.load_llm()
 
         chain = prompt | llm | StrOutputParser()
+        generation_start = time.time()
         output = chain.invoke({"context": context_text, "question": query, "chat_history": chat_history})
+        trace.add("generation_latency_ms", int((time.time() - generation_start) * 1000))
         output = strip_reasoning_tokens(output)
 
         if not retrieved_documents:
@@ -121,27 +181,86 @@ def invoke_chain(query: str, session_id: str = "default"):
         elif not _judge_groundedness(context_text, output):
             output = "Insufficient context. I cannot confidently answer from the retrieved evidence alone."
 
+        response_cache.set(query, session_id, output, query_embedding=query_embedding)
         session_histories[session_id].append({"user": query, "assistant": output})
-        return output
+        trace.add("cache_hit", "miss")
+        trace.finish("ok")
+        if langfuse_trace:
+            langfuse_trace.update(
+                output={"answer": output},
+                metadata={
+                    "retrieved_source_ids": _source_ids(retrieved_documents),
+                    "cache_hit": "miss",
+                },
+            )
+        return {
+            "answer": output,
+            "cache_hit": "miss",
+            "retrieved_documents": retrieved_documents,
+            "request_id": request_id,
+        }
     except HTTPException:
         raise
-    except Exception:
+    except Exception as exc:
+        trace.finish("error", error=str(exc))
         logger.exception("Failed to generate response.")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="The assistant could not process the request right now. Please try again later.",
         )
 
+
+def invoke_chain(query: str, session_id: str = "default"):
+    return invoke_chain_details(query, session_id=session_id)["answer"]
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """
     Render the chat interface.
     """
-    return templates.TemplateResponse("chat.html", {"request": request})
+    return templates.TemplateResponse(request, "chat.html")
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
+
+@app.get("/ready")
+async def ready():
+    checks = {
+        "app_api_key": bool(app_api_key),
+        "groq_api_key": bool(os.getenv("GROQ_API_KEY")),
+        "chroma_db_path": os.path.exists(os.path.join(BASE_DIR, "chroma_db")),
+    }
+    status_code = status.HTTP_200_OK if all(checks.values()) else status.HTTP_503_SERVICE_UNAVAILABLE
+    return JSONResponse({"status": "ready" if status_code == 200 else "not_ready", "checks": checks}, status_code=status_code)
+
 
 @app.post("/get", response_class=PlainTextResponse)
 async def chat(request: Request, msg: str = Form(..., min_length=1, max_length=2000)):
     session_id = request.headers.get("X-Session-Id", "default")
-    result = invoke_chain(msg.strip(), session_id=session_id)
+    result = await anyio.to_thread.run_sync(
+        lambda: invoke_chain_details(msg.strip(), session_id=session_id, request_id=request.state.request_id)
+    )
     logger.info("Generated response for chat request.")
-    return result
+    return result["answer"]
+
+
+@app.post("/get/stream")
+async def chat_stream(request: Request, msg: str = Form(..., min_length=1, max_length=2000)):
+    session_id = request.headers.get("X-Session-Id", "default")
+    query = msg.strip()
+
+    async def event_stream():
+        yield f"event: request_id\ndata: {request.state.request_id}\n\n"
+        yield "event: status\ndata: retrieving\n\n"
+        result = await anyio.to_thread.run_sync(
+            lambda: invoke_chain_details(query, session_id=session_id, request_id=request.state.request_id)
+        )
+        yield f"event: cache\ndata: {result['cache_hit']}\n\n"
+        for token in result["answer"].split(" "):
+            yield f"event: token\ndata: {token} \n\n"
+        yield "event: done\ndata: [DONE]\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")

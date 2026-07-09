@@ -16,6 +16,9 @@ The application is a **FastAPI-based ecommerce product assistant** that:
 ### Key Endpoints
 - **GET `/`** – Chat UI (web interface)
 - **POST `/get`** – Protected chat endpoint
+- **POST `/get/stream`** – Protected SSE streaming chat endpoint
+- **GET `/health`** – Liveness probe
+- **GET `/ready`** – Readiness probe
 - **GET `/docs`** – Interactive API documentation
 
 ---
@@ -87,6 +90,16 @@ ALLOWED_ORIGINS=http://localhost:8001,http://127.0.0.1:8001,https://yourdomain.c
 # Storage mode (default: "auto")
 # Options: "auto" (fallback cloud→local), "local" (always local), "cloud" (always cloud)
 CHROMA_STORAGE_MODE=auto
+
+# Optional ops controls
+REDIS_URL=redis://localhost:6379/0
+CACHE_ENABLED=true
+CACHE_TTL_SECONDS=3600
+SEMANTIC_CACHE_THRESHOLD=0.92
+RATE_LIMIT_REQUESTS=30
+RATE_LIMIT_WINDOW_SECONDS=60
+LANGFUSE_PUBLIC_KEY=<your-langfuse-public-key>
+LANGFUSE_SECRET_KEY=<your-langfuse-secret-key>
 ```
 
 ### 5. Ingest Data (One-time)
@@ -169,6 +182,13 @@ curl -X POST http://localhost:8001/get \
   -H "X-API-Key: test-local-key" \
   -H "X-Session-Id: user-123" \
   -d "msg=Tell me more about the warranty"
+```
+
+**Streaming Response:**
+```bash
+curl -N -X POST http://localhost:8001/get/stream \
+  -H "X-API-Key: test-local-key" \
+  -d "msg=Can you recommend budget earbuds?"
 ```
 
 **Interactive API Documentation:**
@@ -379,8 +399,19 @@ docker run -p 8001:8001 \
   -e GROQ_API_KEY=$GROQ_API_KEY \
   -e APP_API_KEY=$APP_API_KEY \
   -e ALLOWED_ORIGINS="https://yourdomain.com" \
+  -e REDIS_URL=$REDIS_URL \
   -v chroma_db:/app/chroma_db \
   customer-support-rag:latest
+```
+
+### Kubernetes Deployment
+```bash
+kubectl create secret generic customer-support-rag-secrets \
+  --from-literal=app-api-key="$APP_API_KEY" \
+  --from-literal=groq-api-key="$GROQ_API_KEY" \
+  --from-literal=redis-url="$REDIS_URL"
+
+kubectl apply -f deploy/k8s.yaml
 ```
 
 ### Render/Railway Deployment

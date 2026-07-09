@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: customer-support-rag
+  labels:
+    app: customer-support-rag
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: customer-support-rag
+  template:
+    metadata:
+      labels:
+        app: customer-support-rag
+    spec:
+      containers:
+        - name: app
+          image: customer-support-rag:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8001
+          env:
+            - name: APP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: customer-support-rag-secrets
+                  key: app-api-key
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: customer-support-rag-secrets
+                  key: groq-api-key
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: customer-support-rag-secrets
+                  key: redis-url
+                  optional: true
+            - name: ALLOWED_ORIGINS
+              value: "https://yourdomain.com"
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8001
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: customer-support-rag
+spec:
+  type: ClusterIP
+  selector:
+    app: customer-support-rag
+  ports:
+    - port: 80
+      targetPort: 8001
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: customer-support-rag
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: customer-support-rag
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

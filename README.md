@@ -22,10 +22,22 @@ CHROMA_TENANT=
 CHROMA_DATABASE=
 APP_API_KEY=
 ALLOWED_ORIGINS=http://localhost:8001,http://127.0.0.1:8001
+REDIS_URL=
+CACHE_ENABLED=true
+CACHE_TTL_SECONDS=3600
+SEMANTIC_CACHE_THRESHOLD=0.92
+RATE_LIMIT_REQUESTS=30
+RATE_LIMIT_WINDOW_SECONDS=60
+LANGFUSE_PUBLIC_KEY=
+LANGFUSE_SECRET_KEY=
 ```
 
 `APP_API_KEY` must be sent to protected endpoints in the `X-API-Key` header.
 The browser UI prompts for this value and stores it in local storage.
+
+The chat UI uses `POST /get/stream` for SSE-style streamed responses. `POST
+/get` remains available for blocking clients. `GET /health` is a public
+liveness probe, and `GET /ready` checks required runtime configuration.
 
 `GOOGLE_API_KEY` is only required when `embedding_model.provider` is `google`.
 The default local embedding provider is HuggingFace:
@@ -116,16 +128,16 @@ Target: days, not weeks.
 
 ### Phase 5: Serving and Ops Hardening
 
-- Add streaming responses through SSE or WebSocket instead of blocking HTTP.
-- Add exact-match and semantic caching with Redis.
-- Add tracing with LangSmith or Langfuse, including retrieved documents, prompt
-  versions, latency, token usage, and model cost.
-- Add structured logging, request IDs, health checks, and readiness checks.
-- Add API rate limiting and request-size validation.
-- Pin dependencies and add vulnerability scanning.
-- Improve the Dockerfile with a non-root user, smaller production image, no
-  debug file listing, and health checks.
-- Deploy with autoscaling, readiness probes, and environment-specific config.
+- Stream chat responses through `POST /get/stream` using server-sent events.
+- Cache exact and semantic query matches with Redis when `REDIS_URL` is set,
+  with in-memory fallback for local development.
+- Emit structured request logs with request IDs, retrieved source IDs, cache
+  hit/miss state, and retrieval/generation latency. Langfuse traces are enabled
+  when `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are present.
+- Enforce API-key authentication, form-size validation, and per-key rate limits.
+- Expose `/health` and `/ready` for liveness and readiness probes.
+- Ship a non-root Docker image with a container health check and Kubernetes
+  deployment/HPA manifest in `deploy/k8s.yaml`.
 
 ## Recommended Implementation Order
 

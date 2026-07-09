@@ -19,6 +19,31 @@ class Phase0SecurityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertIn("Invalid or missing API key", response.text)
 
+    def test_stream_endpoint_requires_api_key(self):
+        main.app_api_key = "secret-key"
+        client = TestClient(main.app)
+
+        response = client.post("/get/stream", data={"msg": "hello"})
+
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("Invalid or missing API key", response.text)
+
+    def test_health_endpoint_is_public(self):
+        client = TestClient(main.app)
+
+        response = client.get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "healthy")
+
+    def test_ready_endpoint_reports_checks(self):
+        client = TestClient(main.app)
+
+        response = client.get("/ready")
+
+        self.assertIn(response.status_code, {200, 503})
+        self.assertIn("checks", response.json())
+
 
 if __name__ == "__main__":
     unittest.main()
