@@ -2,7 +2,6 @@ import os
 import logging
 
 from dotenv import load_dotenv
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from utils.config_loader import load_config
 from langchain_groq import ChatGroq
 
@@ -34,6 +33,8 @@ class ModelLoader:
             model_name=self.config["embedding_model"]["model_name"]
 
             if provider == "google":
+                from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
                 self._get_required_env(["GOOGLE_API_KEY"])
                 logger.info("Loading Google embedding model: %s", model_name)
                 return GoogleGenerativeAIEmbeddings(model=model_name)

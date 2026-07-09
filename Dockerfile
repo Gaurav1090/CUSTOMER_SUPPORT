@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
@@ -17,7 +17,7 @@ COPY templates ./templates
 COPY utils ./utils
 COPY main.py ./
 
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --prefer-binary --no-compile -r requirements.txt
 
 RUN mkdir -p /app/chroma_db /app/data && \
     adduser --disabled-password --gecos "" appuser && \
