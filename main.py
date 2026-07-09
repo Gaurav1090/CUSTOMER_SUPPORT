@@ -11,8 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 
-from langchain_core.runnables import RunnablePassthrough
-
 from langchain_core.output_parsers import StrOutputParser
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -88,18 +86,15 @@ def strip_reasoning_tokens(output: str) -> str:
 
 def invoke_chain(query: str):
     try:
-        retriever = retriever_obj.load_retriever()
+        retrieved_documents = retriever_obj.call_retriever(query)
+        context_text = "\n\n".join(
+            f"- {doc.page_content}" for doc in retrieved_documents
+        )
         prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATES["product_bot"])
         llm = model_loader.load_llm()
 
-        chain = (
-            {"context": retriever, "question": RunnablePassthrough()}
-            | prompt
-            | llm
-            | StrOutputParser()
-        )
-
-        output = chain.invoke(query)
+        chain = prompt | llm | StrOutputParser()
+        output = chain.invoke({"context": context_text, "question": query})
         return strip_reasoning_tokens(output)
     except HTTPException:
         raise

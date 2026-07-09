@@ -13,6 +13,8 @@ ingestion:
 
 retriever:
   top_k: 10
+  hybrid: true
+  rerank_top_k: 5
 
 llm:
   provider: "groq"
