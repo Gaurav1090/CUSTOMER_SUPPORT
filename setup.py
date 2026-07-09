@@ -5,4 +5,4 @@ setup(name="e-commerce-bot",
        author="sunny",
        author_email="snshrivas3365@gmail.com",
        packages=find_packages(),
-       install_requires=['langchain-astradb','langchain'])
+       install_requires=[])

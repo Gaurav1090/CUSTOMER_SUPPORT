@@ -19,7 +19,9 @@ COPY main.py ./
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN adduser --disabled-password --gecos "" appuser && chown -R appuser:appuser /app
+RUN mkdir -p /app/chroma_db /app/data && \
+    adduser --disabled-password --gecos "" appuser && \
+    chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8001

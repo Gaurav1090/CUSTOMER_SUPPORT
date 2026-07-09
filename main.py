@@ -228,10 +228,20 @@ async def health():
 
 @app.get("/ready")
 async def ready():
+    chroma_storage_mode = os.getenv("CHROMA_STORAGE_MODE", "auto").strip().lower()
+    chroma_cloud_ready = all(
+        [
+            os.getenv("CHROMA_API_KEY"),
+            os.getenv("CHROMA_TENANT"),
+            os.getenv("CHROMA_DATABASE"),
+        ]
+    )
+    chroma_local_ready = os.path.exists(os.path.join(BASE_DIR, "chroma_db"))
+    chroma_ready = chroma_cloud_ready if chroma_storage_mode in {"cloud", "remote"} else chroma_local_ready or chroma_cloud_ready
     checks = {
         "app_api_key": bool(app_api_key),
         "groq_api_key": bool(os.getenv("GROQ_API_KEY")),
-        "chroma_db_path": os.path.exists(os.path.join(BASE_DIR, "chroma_db")),
+        "chroma_storage": chroma_ready,
     }
     status_code = status.HTTP_200_OK if all(checks.values()) else status.HTTP_503_SERVICE_UNAVAILABLE
     return JSONResponse({"status": "ready" if status_code == 200 else "not_ready", "checks": checks}, status_code=status_code)
