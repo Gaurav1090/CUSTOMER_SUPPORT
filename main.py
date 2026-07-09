@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import secrets
+from collections import defaultdict
 
 import uvicorn
 from fastapi import FastAPI, Form, HTTPException, Request, status
@@ -56,6 +57,8 @@ retriever_obj = Retriever()
 
 model_loader = ModelLoader()
 
+session_histories = defaultdict(list)
+
 
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
@@ -84,18 +87,42 @@ def strip_reasoning_tokens(output: str) -> str:
     return output.strip()
 
 
-def invoke_chain(query: str):
+def _build_chat_history(session_id: str) -> str:
+    history = session_histories.get(session_id, [])
+    if not history:
+        return "No prior conversation."
+    return "\n".join(f"User: {item['user']}\nAssistant: {item['assistant']}" for item in history[-4:])
+
+
+def _judge_groundedness(context: str, answer: str) -> bool:
+    judge_prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATES["grounding_judge"])
+    llm = model_loader.load_llm()
+    chain = judge_prompt | llm | StrOutputParser()
+    verdict = chain.invoke({"context": context, "answer": answer}).strip().upper()
+    return verdict == "YES"
+
+
+def invoke_chain(query: str, session_id: str = "default"):
     try:
         retrieved_documents = retriever_obj.call_retriever(query)
         context_text = "\n\n".join(
-            f"- {doc.page_content}" for doc in retrieved_documents
+            f"- {doc.page_content} [source:{doc.metadata.get('source_id', 'unknown')}]" for doc in retrieved_documents
         )
+        chat_history = _build_chat_history(session_id)
         prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATES["product_bot"])
         llm = model_loader.load_llm()
 
         chain = prompt | llm | StrOutputParser()
-        output = chain.invoke({"context": context_text, "question": query})
-        return strip_reasoning_tokens(output)
+        output = chain.invoke({"context": context_text, "question": query, "chat_history": chat_history})
+        output = strip_reasoning_tokens(output)
+
+        if not retrieved_documents:
+            output = "Insufficient context. Please provide more details about the product or issue."
+        elif not _judge_groundedness(context_text, output):
+            output = "Insufficient context. I cannot confidently answer from the retrieved evidence alone."
+
+        session_histories[session_id].append({"user": query, "assistant": output})
+        return output
     except HTTPException:
         raise
     except Exception:
@@ -113,7 +140,8 @@ async def index(request: Request):
     return templates.TemplateResponse("chat.html", {"request": request})
 
 @app.post("/get", response_class=PlainTextResponse)
-async def chat(msg: str = Form(..., min_length=1, max_length=2000)):
-    result = invoke_chain(msg.strip())
+async def chat(request: Request, msg: str = Form(..., min_length=1, max_length=2000)):
+    session_id = request.headers.get("X-Session-Id", "default")
+    result = invoke_chain(msg.strip(), session_id=session_id)
     logger.info("Generated response for chat request.")
     return result
