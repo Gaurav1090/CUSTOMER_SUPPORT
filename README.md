@@ -1,7 +1,7 @@
 # Customer Support System
 
-FastAPI-based ecommerce product assistant using LangChain, AstraDB vector search,
-Google embeddings, and a Groq-hosted LLM.
+FastAPI-based ecommerce product assistant using LangChain, Chroma vector search,
+configurable embeddings, and a Groq-hosted LLM.
 
 ## Local Setup
 
@@ -17,10 +17,28 @@ Required environment variables:
 ```bash
 GOOGLE_API_KEY=
 GROQ_API_KEY=
-ASTRA_DB_API_ENDPOINT=
-ASTRA_DB_APPLICATION_TOKEN=
-ASTRA_DB_KEYSPACE=
+CHROMA_API_KEY=
+CHROMA_TENANT=
+CHROMA_DATABASE=
+APP_API_KEY=
+ALLOWED_ORIGINS=http://localhost:8001,http://127.0.0.1:8001
 ```
+
+`APP_API_KEY` must be sent to protected endpoints in the `X-API-Key` header.
+The browser UI prompts for this value and stores it in local storage.
+
+`GOOGLE_API_KEY` is only required when `embedding_model.provider` is `google`.
+The default local embedding provider is HuggingFace:
+
+```yaml
+embedding_model:
+  provider: "huggingface"
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+```
+
+If you change embedding models after inserting documents into Chroma, use a new
+collection name or clear the old collection first. Different embedding models
+usually produce different vector dimensions.
 
 ## Production Readiness Roadmap
 
@@ -40,7 +58,7 @@ Target: days, not weeks.
   Groq/DeepSeek model.
 - Strip DeepSeek-R1 reasoning traces, such as `<think>...</think>`, before
   returning output to users.
-- Wrap LLM, AstraDB, and embedding calls in `try/except` blocks with safe,
+- Wrap LLM, Chroma, and embedding calls in `try/except` blocks with safe,
   user-friendly error responses instead of raw 500s.
 - Escape or safely render user and model messages in the frontend to avoid
   HTML/script injection.

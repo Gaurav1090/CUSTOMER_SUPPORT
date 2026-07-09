@@ -1,10 +1,13 @@
 import os
-from langchain_astradb import AstraDBVectorStore
+import logging
 from typing import List
 from langchain_core.documents import Document
+from utils.chroma_utils import create_chroma_store
 from utils.config_loader import load_config
 from utils.model_loader import ModelLoader
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 class Retriever:
     
@@ -18,8 +21,10 @@ class Retriever:
     def _load_env_variables(self):
          
         load_dotenv()
-         
-        required_vars = ["GOOGLE_API_KEY", "ASTRA_DB_API_ENDPOINT", "ASTRA_DB_APPLICATION_TOKEN", "ASTRA_DB_KEYSPACE"]
+
+        required_vars = []
+        if self.config["embedding_model"]["provider"] == "google":
+            required_vars.append("GOOGLE_API_KEY")
         
         missing_vars = [var for var in required_vars if os.getenv(var) is None]
         
@@ -27,34 +32,40 @@ class Retriever:
             raise EnvironmentError(f"Missing environment variables: {missing_vars}")
 
         self.google_api_key = os.getenv("GOOGLE_API_KEY")
-        self.db_api_endpoint = os.getenv("ASTRA_DB_API_ENDPOINT")
-        self.db_application_token = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
-        self.db_keyspace = os.getenv("ASTRA_DB_KEYSPACE")
+        self.chroma_api_key = os.getenv("CHROMA_API_KEY")
+        self.chroma_tenant = os.getenv("CHROMA_TENANT")
+        self.chroma_database = os.getenv("CHROMA_DATABASE")
         
     
     def load_retriever(self):
-        if not self.vstore:
-            collection_name = self.config["astra_db"]["collection_name"]
-            
-            self.vstore = AstraDBVectorStore(
-                embedding= self.model_loader.load_embeddings(),
-                collection_name=collection_name,
-                api_endpoint=self.db_api_endpoint,
-                token=self.db_application_token,
-                namespace=self.db_keyspace,
-            )
-        if not self.retriever:
-            top_k = self.config["retriever"]["top_k"] if "retriever" in self.config else 3
-            retriever = self.vstore.as_retriever(search_kwargs={"k": top_k})
-            print("Retriever loaded successfully.")
-            return retriever
+        try:
+            if not self.vstore:
+                self.vstore = create_chroma_store(
+                    collection_name=self.config["chroma"]["collection_name"],
+                    embedding_function=self.model_loader.load_embeddings(),
+                    chroma_api_key=self.chroma_api_key,
+                    chroma_tenant=self.chroma_tenant,
+                    chroma_database=self.chroma_database,
+                    persist_directory=os.path.join(os.getcwd(), "chroma_db"),
+                    storage_mode=os.getenv("CHROMA_STORAGE_MODE", "auto"),
+                )
+            if not self.retriever:
+                top_k = self.config["retriever"]["top_k"] if "retriever" in self.config else 3
+                self.retriever = self.vstore.as_retriever(search_kwargs={"k": top_k})
+                logger.info("Retriever loaded successfully with top_k=%s.", top_k)
+            return self.retriever
+        except Exception as exc:
+            raise RuntimeError("Failed to load Chroma retriever.") from exc
    
 
     
     def call_retriever(self,query:str)-> List[Document]:
-        retriever=self.load_retriever()
-        output=retriever.invoke(query)
-        return output
+        try:
+            retriever=self.load_retriever()
+            output=retriever.invoke(query)
+            return output
+        except Exception as exc:
+            raise RuntimeError("Failed to retrieve relevant documents.") from exc
         
     
 if __name__=='__main__':

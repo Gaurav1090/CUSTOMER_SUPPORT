@@ -1,15 +1,15 @@
 import os
 import pandas as pd
 from dotenv import load_dotenv
-from typing import List, Tuple
+from typing import List
 from langchain_core.documents import Document
-from langchain_astradb import AstraDBVectorStore
+from utils.chroma_utils import create_chroma_store
 from utils.model_loader import ModelLoader
-from config.config_loader import load_config
+from utils.config_loader import load_config
 
 class DataIngestion:
     """
-    Class to handle data transformation and ingestion into AstraDB vector store.
+    Class to handle data transformation and ingestion into Chroma vector store.
     """
 
     def __init__(self):
@@ -17,30 +17,30 @@ class DataIngestion:
         Initialize environment variables, embedding model, and set CSV file path.
         """
         print("Initializing DataIngestion pipeline...")
+        self.config=load_config()
         self.model_loader=ModelLoader()
         self._load_env_variables()
         self.csv_path = self._get_csv_path()
         self.product_data = self._load_csv()
-        self.config=load_config()
 
     def _load_env_variables(self):
         """
-        Load and validate required environment variables.
+        Load optional environment variables.
         """
         load_dotenv()
-        
-        required_vars = ["GOOGLE_API_KEY", "ASTRA_DB_API_ENDPOINT", "ASTRA_DB_APPLICATION_TOKEN", "ASTRA_DB_KEYSPACE"]
-        
+
+        required_vars = []
+        if self.config["embedding_model"]["provider"] == "google":
+            required_vars.append("GOOGLE_API_KEY")
+
         missing_vars = [var for var in required_vars if os.getenv(var) is None]
         if missing_vars:
             raise EnvironmentError(f"Missing environment variables: {missing_vars}")
-        
-        self.google_api_key = os.getenv("GOOGLE_API_KEY")
-        self.db_api_endpoint = os.getenv("ASTRA_DB_API_ENDPOINT")
-        self.db_application_token = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
-        self.db_keyspace = os.getenv("ASTRA_DB_KEYSPACE")
 
-       
+        self.google_api_key = os.getenv("GOOGLE_API_KEY")
+        self.chroma_api_key = os.getenv("CHROMA_API_KEY")
+        self.chroma_tenant = os.getenv("CHROMA_TENANT")
+        self.chroma_database = os.getenv("CHROMA_DATABASE")
 
     def _get_csv_path(self):
         """
@@ -96,19 +96,36 @@ class DataIngestion:
 
     def store_in_vector_db(self, documents: List[Document]):
         """
-        Store documents into AstraDB vector store.
+        Store documents into Chroma vector store.
         """
-        collection_name=self.config["astra_db"]["collection_name"]
-        vstore = AstraDBVectorStore(
-            embedding= self.model_loader.load_embeddings(),
-            collection_name=collection_name,
-            api_endpoint=self.db_api_endpoint,
-            token=self.db_application_token,
-            namespace=self.db_keyspace,
+        persist_directory = os.path.join(os.getcwd(), "chroma_db")
+        vstore = create_chroma_store(
+            collection_name=self.config["chroma"]["collection_name"],
+            embedding_function=self.model_loader.load_embeddings(),
+            chroma_api_key=self.chroma_api_key,
+            chroma_tenant=self.chroma_tenant,
+            chroma_database=self.chroma_database,
+            persist_directory=persist_directory,
+            storage_mode=os.getenv("CHROMA_STORAGE_MODE", "auto"),
         )
+        try:
+            inserted_ids = vstore.add_documents(documents)
+        except Exception as exc:
+            if "quota" not in str(exc).lower() and "rate limit" not in str(exc).lower():
+                raise
+            print("Cloud Chroma quota exceeded; retrying with local persistence.")
+            vstore = create_chroma_store(
+                collection_name=self.config["chroma"]["collection_name"],
+                embedding_function=self.model_loader.load_embeddings(),
+                chroma_api_key=None,
+                chroma_tenant=None,
+                chroma_database=None,
+                persist_directory=persist_directory,
+                storage_mode="local",
+            )
+            inserted_ids = vstore.add_documents(documents)
 
-        inserted_ids = vstore.add_documents(documents)
-        print(f"Successfully inserted {len(inserted_ids)} documents into AstraDB.")
+        print(f"Successfully inserted {len(inserted_ids)} documents into Chroma.")
         return vstore, inserted_ids
 
     def run_pipeline(self):

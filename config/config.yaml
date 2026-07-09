@@ -1,13 +1,13 @@
-astra_db:
+chroma:
   collection_name: "ecommercedata"
 
 embedding_model:
-  provider: "google"
-  model_name: "models/text-embedding-004"
+  provider: "huggingface"
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
 
 retriever:
   top_k: 10
 
 llm:
-  provider: "google"
+  provider: "groq"
   model_name: "deepseek-r1-distill-llama-70b" 

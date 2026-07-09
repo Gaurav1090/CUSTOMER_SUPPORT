@@ -42,16 +42,38 @@
 
     <script>
     $(document).ready(function() {
+        function escapeHtml(value) {
+            return $("<div>").text(value).html();
+        }
+
+        function getApiKey() {
+            var apiKey = window.localStorage.getItem("APP_API_KEY");
+            if (!apiKey) {
+                apiKey = window.prompt("Enter application API key");
+                if (apiKey) {
+                    window.localStorage.setItem("APP_API_KEY", apiKey);
+                }
+            }
+            return apiKey;
+        }
+
         $("#messageArea").on("submit", function(event) {
             const date = new Date();
             const hour = date.getHours();
             const minute = date.getMinutes();
             const str_time = `${hour}:${minute}`;
             var rawText = $("#text").val();
+            var safeText = escapeHtml(rawText);
+            var apiKey = getApiKey();
+
+            if (!apiKey) {
+                event.preventDefault();
+                return;
+            }
 
             var userHtml = `
                 <div class="d-flex justify-content-end mb-4">
-                    <div class="msg_cotainer_send">${rawText}
+                    <div class="msg_cotainer_send">${safeText}
                         <span class="msg_time_send">${str_time}</span>
                     </div>
                     <div class="img_cont_msg">
@@ -66,17 +88,31 @@
                 data: { msg: rawText },
                 type: "POST",
                 url: "/get",
+                headers: { "X-API-Key": apiKey },
             }).done(function(data) {
+                var safeData = escapeHtml(data);
                 var botHtml = `
                     <div class="d-flex justify-content-start mb-4">
                         <div class="img_cont_msg">
                             <img src="https://static.vecteezy.com/system/resources/previews/016/017/018/non_2x/ecommerce-icon-free-png.png" class="rounded-circle user_img_msg">
                         </div>
-                        <div class="msg_cotainer">${data}
+                        <div class="msg_cotainer">${safeData}
                             <span class="msg_time">${str_time}</span>
                         </div>
                     </div>`;
                 $("#messageFormeight").append($.parseHTML(botHtml));
+                $("#messageFormeight").scrollTop($("#messageFormeight")[0].scrollHeight);
+            }).fail(function() {
+                var errorHtml = `
+                    <div class="d-flex justify-content-start mb-4">
+                        <div class="img_cont_msg">
+                            <img src="https://static.vecteezy.com/system/resources/previews/016/017/018/non_2x/ecommerce-icon-free-png.png" class="rounded-circle user_img_msg">
+                        </div>
+                        <div class="msg_cotainer">The assistant is unavailable right now. Please try again later.
+                            <span class="msg_time">${str_time}</span>
+                        </div>
+                    </div>`;
+                $("#messageFormeight").append($.parseHTML(errorHtml));
                 $("#messageFormeight").scrollTop($("#messageFormeight")[0].scrollHeight);
             });
 

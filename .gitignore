@@ -4,3 +4,9 @@ venv
 e_commerce_bot.egg-info
 archive
 data_archive
+chroma_db
+.venv
+custmor_support_system_main.egg-info
+__pycache__
+*.pyc
+.python-version
