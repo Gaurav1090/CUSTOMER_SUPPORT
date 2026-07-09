@@ -25,32 +25,26 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8001
-          # Mount the persistent volume for ChromaDB
           volumeMounts:
             - name: chroma-db-storage
               mountPath: /app/chroma_db
+            - name: gcp-secrets
+              mountPath: "/var/secrets/gcp"
+              readOnly: true
           env:
-            # These secrets will be populated by the Secret Manager CSI driver
             - name: APP_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: app-api-key # Name of the secret in Secret Manager
-                  key: latest      # Use the latest version
+              valueFrom: { secretKeyRef: { name: gcp-secrets-file, key: app-api-key } }
             - name: GROQ_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: groq-api-key
-                  key: latest
+              valueFrom: { secretKeyRef: { name: gcp-secrets-file, key: groq-api-key } }
             - name: REDIS_HOST # Assuming you will use Memorystore
-              valueFrom:
-                secretKeyRef:
-                  name: redis-host
-                  key: latest
+              valueFrom: { secretKeyRef: { name: gcp-secrets-file, key: redis-host } }
             - name: ALLOWED_ORIGINS
               value: "https://yourdomain.com"
             # Tell the app to use the local file system for Chroma
             - name: CHROMA_STORAGE_MODE
               value: "local"
+          # The application code must be updated to read secrets from these file paths
+          # e.g., APP_API_KEY_FILE=/var/secrets/gcp/app-api-key
           readinessProbe:
             httpGet:
               path: /ready
@@ -78,6 +72,12 @@ spec:
         - name: chroma-db-storage
           persistentVolumeClaim:
             claimName: chroma-db-pvc
+        - name: gcp-secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: "gcp-secrets-provider"
 ---
 apiVersion: v1
 kind: Service
@@ -128,3 +128,31 @@ spec:
         target:
           type: Utilization
           averageUtilization: 70
+---
+# This resource tells the Secrets Store CSI driver how to fetch secrets
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: gcp-secrets-provider
+spec:
+  provider: gcp
+  parameters:
+    secrets: |
+      - resourceName: "projects/${GCP_PROJECT_ID}/secrets/app-api-key/versions/latest"
+        fileName: "app-api-key"
+      - resourceName: "projects/${GCP_PROJECT_ID}/secrets/groq-api-key/versions/latest"
+        fileName: "groq-api-key"
+      - resourceName: "projects/${G_PROJECT_ID}/secrets/redis-host/versions/latest"
+        fileName: "redis-host"
+  # This (optional) block creates a native Kubernetes secret from the fetched secrets,
+  # allowing the 'valueFrom' syntax to work as you originally intended.
+  secretObjects:
+  - secretName: gcp-secrets-file
+    type: Opaque
+    data:
+    - key: app-api-key
+      objectName: app-api-key
+    - key: groq-api-key
+      objectName: groq-api-key
+    - key: redis-host
+      objectName: redis-host
