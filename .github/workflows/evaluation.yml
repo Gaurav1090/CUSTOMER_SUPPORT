@@ -27,24 +27,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: Run RAG evaluation tests
+      - name: Run all tests and generate evaluation report
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           CHROMA_API_KEY: ${{ secrets.CHROMA_API_KEY }}
           CHROMA_TENANT: ${{ secrets.CHROMA_TENANT }}
           CHROMA_DATABASE: ${{ secrets.CHROMA_DATABASE }}
         run: |
-          python -m unittest tests.test_phase4_evaluation tests.test_phase4_ci -v
-      
-      - name: Run full test suite
-        env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: |
+          # Run all unit tests from the 'tests' directory
           python -m unittest discover tests -p "test_phase*.py" -v
-      
-      - name: Generate evaluation report
-        if: always()
-        run: |
+
+          # Generate the full evaluation report for artifacts
           python evaluation/run_evaluation.py
       
       - name: Upload evaluation results
