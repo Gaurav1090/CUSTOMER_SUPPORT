@@ -38,7 +38,7 @@ jobs:
           python -m unittest discover tests -p "test_phase*.py" -v
 
           # Generate the full evaluation report for artifacts
-          python evaluation/run_evaluation.py
+          python -m evaluation.run_evaluation
       
       - name: Upload evaluation results
         if: always()
