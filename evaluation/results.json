@@ -1,0 +1,97 @@
+{
+  "test_set_size": 3,
+  "results": [
+    {
+      "question": "Can you recommend a good budget headphone?",
+      "retrieval": {
+        "context_precision": 0.0,
+        "context_recall": 0.0,
+        "retrieved_source_ids": [
+          "row-449",
+          "row-395",
+          "row-60",
+          "row-375"
+        ],
+        "expected_source_ids": [
+          "row-246",
+          "row-250"
+        ]
+      },
+      "generation": {
+        "faithfulness": 0.559322033898305,
+        "answer_relevance": 1.0,
+        "expected_keywords": [
+          "budget",
+          "headphone"
+        ]
+      },
+      "overall_score": 0.38983050847457623,
+      "retrieved_count": 4,
+      "answer_length": 444
+    },
+    {
+      "question": "What are the best earbuds under 2000?",
+      "retrieval": {
+        "context_precision": 0.0,
+        "context_recall": 0.0,
+        "retrieved_source_ids": [
+          "row-16",
+          "row-152",
+          "row-90",
+          "row-157"
+        ],
+        "expected_source_ids": [
+          "row-246",
+          "row-250"
+        ]
+      },
+      "generation": {
+        "faithfulness": 0.2727272727272727,
+        "answer_relevance": 0.0,
+        "expected_keywords": [
+          "budget",
+          "earbuds",
+          "2000"
+        ]
+      },
+      "overall_score": 0.06818181818181818,
+      "retrieved_count": 4,
+      "answer_length": 84
+    },
+    {
+      "question": "Tell me about wireless headsets with good battery life.",
+      "retrieval": {
+        "context_precision": 0.0,
+        "context_recall": 0.0,
+        "retrieved_source_ids": [
+          "row-369",
+          "row-58",
+          "row-407",
+          "row-360"
+        ],
+        "expected_source_ids": [
+          "row-246"
+        ]
+      },
+      "generation": {
+        "faithfulness": 0.3584905660377358,
+        "answer_relevance": 1.0,
+        "expected_keywords": [
+          "wireless",
+          "battery",
+          "headset"
+        ]
+      },
+      "overall_score": 0.33962264150943394,
+      "retrieved_count": 4,
+      "answer_length": 435
+    }
+  ],
+  "statistics": {
+    "mean_score": 0.2658783227219428,
+    "min_score": 0.06818181818181818,
+    "max_score": 0.38983050847457623,
+    "passed": 0,
+    "total": 3
+  }
+}

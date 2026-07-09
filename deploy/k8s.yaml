@@ -1,0 +1,158 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: customer-support-rag # This is the 'DEPLOYMENT_NAME' in the CI/CD workflow
+  labels:
+    app: customer-support-rag
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: customer-support-rag
+  template:
+    metadata:
+      labels:
+        app: customer-support-rag
+      annotations:
+        # This annotation links the Kubernetes Service Account to the Google Service Account
+        iam.gke.io/gcp-service-account: customer-support-rag-sa@${GCP_PROJECT_ID}.iam.gserviceaccount.com # <-- Replace with your GSA email
+    spec:
+      # This KSA will be linked to a GSA by Workload Identity
+      serviceAccountName: customer-support-rag-ksa
+      containers:
+        - name: app
+          image: customer-support-rag:latest # This will be replaced by the CI/CD pipeline
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8001
+          volumeMounts:
+            - name: chroma-db-storage
+              mountPath: /app/chroma_db
+            - name: gcp-secrets
+              mountPath: "/var/secrets/gcp"
+              readOnly: true
+          env:
+            - name: APP_API_KEY
+              valueFrom: { secretKeyRef: { name: gcp-secrets-file, key: app-api-key } }
+            - name: GROQ_API_KEY
+              valueFrom: { secretKeyRef: { name: gcp-secrets-file, key: groq-api-key } }
+            - name: REDIS_HOST # Assuming you will use Memorystore
+              valueFrom: { secretKeyRef: { name: gcp-secrets-file, key: redis-host } }
+            - name: ALLOWED_ORIGINS
+              value: "https://yourdomain.com"
+            # Tell the app to use the local file system for Chroma
+            - name: CHROMA_STORAGE_MODE
+              value: "local"
+          # The application code must be updated to read secrets from these file paths
+          # e.g., APP_API_KEY_FILE=/var/secrets/gcp/app-api-key
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8001
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: chroma-db-storage
+          persistentVolumeClaim:
+            claimName: chroma-db-pvc
+        - name: gcp-secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: "gcp-secrets-provider"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: customer-support-rag
+spec:
+  type: ClusterIP
+  selector:
+    app: customer-support-rag
+  ports:
+    - port: 80
+      targetPort: 8001
+---
+# A Kubernetes Service Account for your application pods
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: customer-support-rag-ksa # Must match serviceAccountName in Deployment
+  namespace: default
+---
+# A Persistent Volume Claim to give ChromaDB a stable place to store its data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: chroma-db-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce # Can be mounted by a single node at a time
+  resources:
+    requests:
+      storage: 5Gi # Allocate 5 GB for the vector database
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: customer-support-rag
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: customer-support-rag
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+# This resource tells the Secrets Store CSI driver how to fetch secrets
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: gcp-secrets-provider
+spec:
+  provider: gcp
+  parameters:
+    secrets: |
+      - resourceName: "projects/${GCP_PROJECT_ID}/secrets/app-api-key/versions/latest"
+        fileName: "app-api-key"
+      - resourceName: "projects/${GCP_PROJECT_ID}/secrets/groq-api-key/versions/latest"
+        fileName: "groq-api-key"
+      - resourceName: "projects/${G_PROJECT_ID}/secrets/redis-host/versions/latest"
+        fileName: "redis-host"
+  # This (optional) block creates a native Kubernetes secret from the fetched secrets,
+  # allowing the 'valueFrom' syntax to work as you originally intended.
+  secretObjects:
+  - secretName: gcp-secrets-file
+    type: Opaque
+    data:
+    - key: app-api-key
+      objectName: app-api-key
+    - key: groq-api-key
+      objectName: groq-api-key
+    - key: redis-host
+      objectName: redis-host

@@ -1,13 +1,21 @@
-astra_db:
+chroma:
   collection_name: "ecommercedata"
 
 embedding_model:
-  provider: "google"
-  model_name: "models/text-embedding-004"
+  provider: "huggingface"
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+
+ingestion:
+  chunk_size: 400
+  chunk_overlap: 80
+  state_file: "data/.ingestion_state.json"
+  keyword_index_file: "data/.keyword_index.json"
 
 retriever:
   top_k: 10
+  hybrid: true
+  rerank_top_k: 5
 
 llm:
-  provider: "google"
-  model_name: "deepseek-r1-distill-llama-70b" 
+  provider: "groq"
+  model_name: "llama-3.3-70b-versatile"

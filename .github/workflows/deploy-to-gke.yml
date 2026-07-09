@@ -1,0 +1,86 @@
+name: Build and Deploy to GKE
+
+on:
+  push:
+    branches:
+      - main # Trigger deployment only on pushes to the main branch
+
+env:
+  PROJECT_ID: "project-0fbdbc8d-9379-4cfb-84a"
+  GAR_LOCATION: "us-west1" # Match Terraform region
+  GKE_CLUSTER: "customer-support-rag-cluster" # Name from Terraform: var.app_name + "-cluster"
+  GKE_REGION: "us-west1" # Match Terraform region
+  DEPLOYMENT_NAME: "customer-support-rag"
+  IMAGE: "customer-support-rag"
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Authenticate to Google Cloud using Workload Identity Federation.
+      # This is the most secure method and avoids long-lived service account keys.
+      - id: "auth"
+        uses: "google-github-actions/auth@v2"
+        with:
+          workload_identity_provider: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.GCP_WIF_POOL }}/providers/${{ secrets.GCP_WIF_PROVIDER }}"
+          service_account: "${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}"
+
+      # Set up gcloud CLI
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      # Configure Docker to use the gcloud command-line tool as a credential helper
+      - name: Configure Docker
+        run: gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev
+
+      # Build and push the Docker image to Google Artifact Registry
+      - name: Build and Push Image
+        run: |-
+          docker build \
+            --tag "${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/customer-support-rag-repo/${{ env.IMAGE }}:${{ github.sha }}" \
+            .
+          docker push "${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/customer-support-rag-repo/${{ env.IMAGE }}:${{ github.sha }}"
+
+      # Get GKE credentials
+      - name: Get GKE credentials
+        run: |-
+          gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
+            --region ${{ env.GKE_REGION }}
+
+      # Run one-time data ingestion job
+      - name: Run Data Ingestion Job
+        run: |-
+          # Create a temporary job manifest
+          cat <<EOF > /tmp/ingestion-job.yaml
+          apiVersion: batch/v1
+          kind: Job
+          # ... (rest of job manifest to run ingestion_pipeline.py)
+          EOF
+          # kubectl apply -f /tmp/ingestion-job.yaml
+          # kubectl wait --for=condition=complete job/ingestion-job --timeout=5m
+          echo "NOTE: Data ingestion job step is a placeholder. For a real deployment, you would run 'python data_ingestion/ingestion_pipeline.py' inside a K8s Job."
+
+      # Deploy to GKE
+      - name: Deploy
+        run: |-
+          # Substitute the GCP_PROJECT_ID placeholder in the k8s manifest
+          sed -i 's/${GCP_PROJECT_ID}/${{ env.PROJECT_ID }}/g' deploy/k8s.yaml
+
+          # Apply the updated manifest
+          kubectl apply -f deploy/k8s.yaml
+
+          # Update the deployment with the new image using a robust command
+          kubectl set image deployment/${{ env.DEPLOYMENT_NAME }} app=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/customer-support-rag-repo/${{ env.IMAGE }}:${{ github.sha }}
+
+          # Wait for the new rollout to complete
+          kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }}
+
+      # Clean up credentials
+      - name: "Logout of gcloud"
+        if: always()
+        run: "gcloud auth revoke"

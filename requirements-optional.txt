@@ -1,0 +1,5 @@
+# Optional integrations. Install only when needed:
+#   pip install -r requirements-optional.txt
+langchain-google-genai
+redis
+langfuse
