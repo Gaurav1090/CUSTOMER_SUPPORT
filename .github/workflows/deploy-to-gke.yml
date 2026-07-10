@@ -90,6 +90,16 @@ jobs:
           kubectl wait --for=condition=complete job/data-ingestion-job-${{ github.run_id }} --timeout=5m
           echo "Data ingestion job completed."
 
+      - name: Debug ingestion job on failure
+        if: failure()
+        run: |-
+          echo "=== Pod status ==="
+          kubectl get pods -l job-name=data-ingestion-job-${{ github.run_id }} -o wide
+          echo "=== Pod describe ==="
+          kubectl describe pod -l job-name=data-ingestion-job-${{ github.run_id }}
+          echo "=== Pod logs ==="
+          kubectl logs -l job-name=data-ingestion-job-${{ github.run_id }} --tail=200
+
       # Deploy to GKE
       - name: Deploy
         run: |-
