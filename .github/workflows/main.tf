@@ -144,3 +144,21 @@ resource "google_service_account_iam_member" "cicd_sa_wif_user" {
   # Replace with your GitHub org/username and repo name
   member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_pool.name}/attribute.repository/Gaurav1090/CUSTOMER_SUPPORT"
 }
+
+data "google_compute_network" "default" {
+  name = "default"
+}
+
+resource "google_compute_router" "router" {
+  name    = "${var.app_name}-router"
+  region  = var.gcp_region
+  network = data.google_compute_network.default.id
+}
+
+resource "google_compute_router_nat" "nat" {
+  name                               = "${var.app_name}-nat"
+  router                             = google_compute_router.router.name
+  region                             = var.gcp_region
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+}
