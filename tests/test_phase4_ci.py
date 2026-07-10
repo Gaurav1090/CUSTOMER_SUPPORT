@@ -36,7 +36,6 @@ class Phase4CITests(unittest.TestCase):
         avg_precision = sum(precisions) / len(precisions)
         self.assertGreaterEqual(avg_precision, 0.0, f"Avg precision {avg_precision:.2%} is negative")
 
-    @unittest.skip("Skipping generation test due to decommissioned Groq model; update config.yaml first.")
     def test_no_regressions_on_known_queries(self):
         """Run a sample evaluation and ensure minimum quality bar."""
         results = []

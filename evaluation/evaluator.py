@@ -5,17 +5,21 @@ from langchain_core.documents import Document
 
 logger = logging.getLogger(__name__)
 
+RAGAS_METRICS = []
+
 
 class RAGEvaluator:
     """Lightweight RAG evaluation using available metrics."""
 
     def __init__(self):
-        self.try_ragas = self._try_import_ragas()
+        self.ragas_available = self._try_import_ragas()
 
     def _try_import_ragas(self) -> bool:
         try:
             import ragas
-            from ragas.metrics import answer_relevancy, context_precision, context_recall, faithfulness
+            from ragas.metrics import answer_relevancy, context_precision, context_recall, faithfulness, answer_correctness
+            global RAGAS_METRICS
+            RAGAS_METRICS = [context_precision, context_recall, faithfulness, answer_relevancy, answer_correctness]
             self.ragas_available = True
             return True
         except ImportError:
@@ -29,6 +33,22 @@ class RAGEvaluator:
         retrieved_docs: List[Document],
         expected_source_ids: List[str],
     ) -> Dict[str, Any]:
+        if self.ragas_available:
+            from ragas import evaluate
+            from datasets import Dataset
+
+            dataset = Dataset.from_dict({
+                "question": [question],
+                "contexts": [[doc.page_content for doc in retrieved_docs]],
+                "ground_truth": [" ".join(expected_source_ids)] # Ragas needs a string ground truth
+            })
+            result = evaluate(dataset, metrics=[metric for metric in RAGAS_METRICS if metric.name in ["context_precision", "context_recall"]])
+            return {
+                "context_precision": result["context_precision"],
+                "context_recall": result["context_recall"],
+                "retrieved_source_ids": [doc.metadata.get("source_id") for doc in retrieved_docs],
+                "expected_source_ids": expected_source_ids,
+            }
         """Evaluate retrieval quality using context precision and recall."""
         retrieved_source_ids = {doc.metadata.get("source_id") for doc in retrieved_docs}
         expected_sources = set(expected_source_ids)
@@ -57,6 +77,21 @@ class RAGEvaluator:
         context: str,
         expected_answer_contains: List[str],
     ) -> Dict[str, Any]:
+        if self.ragas_available:
+            from ragas import evaluate
+            from datasets import Dataset
+
+            dataset = Dataset.from_dict({
+                "question": [question],
+                "answer": [answer],
+                "contexts": [[context]],
+                "ground_truth": [" ".join(expected_answer_contains)]
+            })
+            result = evaluate(dataset, metrics=[metric for metric in RAGAS_METRICS if metric.name in ["faithfulness", "answer_relevancy", "answer_correctness"]])
+            return {
+                "faithfulness": result.get("faithfulness", 0.0),
+                "answer_relevance": result.get("answer_relevancy", 0.0),
+            }
         """Evaluate generation quality using faithfulness and relevance."""
         faithfulness_score = self._measure_faithfulness(answer, context)
         relevance_score = self._measure_relevance(answer, question, expected_answer_contains)
