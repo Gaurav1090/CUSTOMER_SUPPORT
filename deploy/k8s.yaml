@@ -15,7 +15,7 @@ spec:
         app: customer-support-rag
       annotations:
         # This annotation links the Kubernetes Service Account to the Google Service Account
-        iam.gke.io/gcp-service-account: customer-support-rag-sa@${GCP_PROJECT_ID}.iam.gserviceaccount.com # <-- Replace with your GSA email
+        iam.gke.io/gcp-service-account: customer-support-rag-sa@project-0fbdbc8d-9379-4cfb-84a.iam.gserviceaccount.com # <-- Replace with your GSA email
     spec:
       # This KSA will be linked to a GSA by Workload Identity
       serviceAccountName: customer-support-rag-ksa
@@ -25,6 +25,10 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8001
+          volumeMounts:
+            - name: secrets-store
+              mountPath: "/mnt/secrets-store"
+              readOnly: true
           env:
             - name: APP_API_KEY
               valueFrom: { secretKeyRef: { name: gcp-secrets-file, key: app-api-key } }
@@ -68,6 +72,13 @@ spec:
             limits:
               cpu: "2"
               memory: 2Gi
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: "gcp-secrets-provider"
 ---
 apiVersion: v1
 kind: Service
@@ -116,17 +127,17 @@ spec:
   provider: gcp
   parameters:
     secrets: |
-      - resourceName: "projects/${GCP_PROJECT_ID}/secrets/app-api-key/versions/latest"
+      - resourceName: "projects/project-0fbdbc8d-9379-4cfb-84a/secrets/app-api-key/versions/latest"
         fileName: "app-api-key"
-      - resourceName: "projects/${GCP_PROJECT_ID}/secrets/groq-api-key/versions/latest"
+      - resourceName: "projects/project-0fbdbc8d-9379-4cfb-84a/secrets/groq-api-key/versions/latest"
         fileName: "groq-api-key"
-      - resourceName: "projects/${GCP_PROJECT_ID}/secrets/redis-host/versions/latest"
+      - resourceName: "projects/project-0fbdbc8d-9379-4cfb-84a/secrets/redis-host/versions/latest"
         fileName: "redis-host"
-      - resourceName: "projects/${GCP_PROJECT_ID}/secrets/chroma-api-key/versions/latest"
+      - resourceName: "projects/project-0fbdbc8d-9379-4cfb-84a/secrets/chroma-api-key/versions/latest"
         fileName: "chroma-api-key"
-      - resourceName: "projects/${GCP_PROJECT_ID}/secrets/chroma-tenant/versions/latest"
+      - resourceName: "projects/project-0fbdbc8d-9379-4cfb-84a/secrets/chroma-tenant/versions/latest"
         fileName: "chroma-tenant"
-      - resourceName: "projects/${GCP_PROJECT_ID}/secrets/chroma-database/versions/latest"
+      - resourceName: "projects/project-0fbdbc8d-9379-4cfb-84a/secrets/chroma-database/versions/latest"
         fileName: "chroma-database"
   # This (optional) block creates a native Kubernetes secret from the fetched secrets,
   # allowing the 'valueFrom' syntax to work as you originally intended.
