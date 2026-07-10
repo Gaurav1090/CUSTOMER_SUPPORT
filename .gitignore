@@ -12,3 +12,6 @@ data/.ingestion_state.json
 data/.keyword_index.json
 *.pyc
 .python-version
+.terraform
+.terraform.lock.hcl
+.terraform.*

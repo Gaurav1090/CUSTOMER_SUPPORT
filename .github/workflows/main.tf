@@ -131,7 +131,7 @@ resource "google_iam_workload_identity_pool_provider" "github_provider" {
     "attribute.actor"      = "assertion.actor"
     "attribute.repository" = "assertion.repository"
   }
-  attribute_condition = "attribute.repository == 'gauravsingh-dev/custmor_support_system-main'"
+  attribute_condition = "attribute.repository == 'Gaurav1090/CUSTOMER_SUPPORT'"
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
   }
@@ -142,5 +142,5 @@ resource "google_service_account_iam_member" "cicd_sa_wif_user" {
   service_account_id = google_service_account.cicd_sa.name
   role               = "roles/iam.workloadIdentityUser"
   # Replace with your GitHub org/username and repo name
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_pool.name}/attribute.repository/gauravsingh-dev/custmor_support_system-main"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_pool.name}/attribute.repository/Gaurav1090/CUSTOMER_SUPPORT"
 }
