@@ -131,7 +131,7 @@ resource "google_iam_workload_identity_pool_provider" "github_provider" {
     "attribute.actor"      = "assertion.actor"
     "attribute.repository" = "assertion.repository"
   }
-  attribute_condition = "attribute.repository == 'Gaurav1090/CUSTOMER_SUPPORT' && assertion.ref == 'refs/heads/main' && assertion.event_name == 'push'"
+  attribute_condition = "attribute.repository == 'Gaurav1090/CUSTOMER_SUPPORT' && assertion.ref == 'refs/heads/main' && (assertion.event_name == 'push' || assertion.event_name == 'workflow_run')"
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
   }
@@ -142,5 +142,5 @@ resource "google_service_account_iam_member" "cicd_sa_wif_user" {
   service_account_id = google_service_account.cicd_sa.name
   role               = "roles/iam.workloadIdentityUser"
   # Replace with your GitHub org/username and repo name
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_pool.name}/repository/Gaurav1090/CUSTOMER_SUPPORT"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_pool.name}/attribute.repository/Gaurav1090/CUSTOMER_SUPPORT"
 }
