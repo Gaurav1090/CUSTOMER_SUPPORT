@@ -1,7 +1,6 @@
 import logging
 from typing import Any, Dict, List
 
-from datasets import Dataset
 from langchain_core.documents import Document
 
 logger = logging.getLogger(__name__)
@@ -13,7 +12,7 @@ class RAGEvaluator:
     """Lightweight RAG evaluation using available metrics."""
 
     def __init__(self):
-        self.try_ragas = self._try_import_ragas()
+        self.ragas_available = self._try_import_ragas()
 
     def _try_import_ragas(self) -> bool:
         try:
@@ -36,6 +35,7 @@ class RAGEvaluator:
     ) -> Dict[str, Any]:
         if self.ragas_available:
             from ragas import evaluate
+            from datasets import Dataset
 
             dataset = Dataset.from_dict({
                 "question": [question],
@@ -79,6 +79,7 @@ class RAGEvaluator:
     ) -> Dict[str, Any]:
         if self.ragas_available:
             from ragas import evaluate
+            from datasets import Dataset
 
             dataset = Dataset.from_dict({
                 "question": [question],
