@@ -1,13 +1,13 @@
-import json
 import logging
-import math
 import os
 import re
+import time
 from typing import Any, Dict, List, Tuple
 
 from dotenv import load_dotenv
 from langchain_core.documents import Document
 
+from utils.bm25_index import load_index
 from utils.chroma_utils import create_chroma_store
 from utils.config_loader import load_config
 from utils.model_loader import ModelLoader
@@ -23,7 +23,15 @@ class Retriever:
         self._load_env_variables()
         self.vstore = None
         self.retriever = None
-        self.keyword_index_path = os.path.join(os.getcwd(), self.config.get("ingestion", {}).get("keyword_index_file", "data/.keyword_index.json"))
+        ingestion_cfg = self.config.get("ingestion", {})
+        index_path = os.getenv("INDEX_PATH", ingestion_cfg.get("index_path", "data/landing/_index"))
+        self.bm25_index_uri = f"{index_path.rstrip('/')}/bm25_index.json"
+        self._bm25_index = None
+        self._bm25_loaded_at = 0.0
+        # Reload the persisted BM25 index at most this often -- it's rebuilt
+        # by the ingestion job, not this process, so a short TTL is enough to
+        # pick up new content without re-reading it on every single query.
+        self._bm25_refresh_seconds = int(os.getenv("BM25_REFRESH_SECONDS", "60"))
 
     def _load_env_variables(self):
         load_dotenv()
@@ -195,29 +203,16 @@ class Retriever:
             return 4
         return 5
 
+    def _load_bm25_index(self):
+        now = time.time()
+        if self._bm25_index is None or (now - self._bm25_loaded_at) > self._bm25_refresh_seconds:
+            self._bm25_index = load_index(self.bm25_index_uri)
+            self._bm25_loaded_at = now
+        return self._bm25_index
+
     def keyword_search(self, query: str, top_k: int = 5) -> List[Document]:
-        if not os.path.exists(self.keyword_index_path):
-            return []
-
-        with open(self.keyword_index_path, "r", encoding="utf-8") as handle:
-            keyword_index = json.load(handle)
-
-        query_tokens = self._tokenize(query)
-        if not query_tokens:
-            return []
-
-        scored_results = []
-        for doc_id, payload in keyword_index.items():
-            tokens = payload.get("tokens", {})
-            score = sum(tokens.get(token, 0) for token in query_tokens)
-            if score > 0:
-                scored_results.append((score, doc_id, payload))
-
-        scored_results.sort(reverse=True)
-        results = []
-        for _, _, payload in scored_results[:top_k]:
-            results.append(Document(page_content=payload.get("text", ""), metadata=payload.get("metadata", {})))
-        return results
+        bm25_index = self._load_bm25_index()
+        return bm25_index.search(query, top_k=top_k)
 
     def call_retriever(self, query: str) -> List[Document]:
         try:

@@ -8,8 +8,19 @@ embedding_model:
 ingestion:
   chunk_size: 400
   chunk_overlap: 80
-  state_file: "data/.ingestion_state.json"
-  keyword_index_file: "data/.keyword_index.json"
+  # Where source documents land before ingestion. Local dev: a plain folder.
+  # Prod: swap for "gs://bucket/landing", "s3://bucket/landing", or
+  # "abfs://container/landing" -- no code change needed, only this value
+  # (or the LANDING_PATH env var, which takes precedence).
+  landing_path: "data/landing"
+  # Ingestion state (processed file/chunk manifest) and the BM25 keyword
+  # index both live under this prefix, in the same storage backend as the
+  # landing path, so a fresh ingestion job container has no local state to
+  # lose.
+  index_path: "data/landing/_index"
+  supported_extensions: [".pdf"]
+  # Legacy CSV path, kept for the bundled demo dataset / tests only.
+  legacy_csv_path: "data/flipkart_product_review.csv"
 
 retriever:
   top_k: 10

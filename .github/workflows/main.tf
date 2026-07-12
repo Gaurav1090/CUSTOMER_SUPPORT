@@ -65,13 +65,11 @@ resource "google_container_node_pool" "primary_nodes" {
 
   autoscaling {
     min_node_count = 1
-    max_node_count = 5
+    max_node_count = 3
   }
 
   node_config {
     machine_type = "e2-medium"
-    disk_size_gb = 40              # was defaulting to 100GB
-    disk_type    = "pd-standard"
     oauth_scopes = [
       "https://www.googleapis.com/auth/cloud-platform"
     ]
@@ -163,14 +161,4 @@ resource "google_compute_router_nat" "nat" {
   region                             = var.gcp_region
   nat_ip_allocate_option             = "AUTO_ONLY"
   source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
-}
-
-data "google_project" "current" {
-  project_id = var.gcp_project_id
-}
-
-resource "google_project_iam_member" "gke_nodes_artifact_registry_reader" {
-  project = var.gcp_project_id
-  role    = "roles/artifactregistry.reader"
-  member  = "serviceAccount:${data.google_project.current.number}-compute@developer.gserviceaccount.com"
 }

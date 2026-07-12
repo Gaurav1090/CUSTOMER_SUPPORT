@@ -26,9 +26,27 @@ def create_chroma_store(
     storage_mode = (storage_mode or os.getenv("CHROMA_STORAGE_MODE", "auto")).strip().lower()
     cloud_ready = all([chroma_api_key, chroma_tenant, chroma_database])
 
-    if storage_mode in {"cloud", "remote"}:
+    if storage_mode in {"local", "persist", "filesystem"}:
+        logger.info("Chroma storage mode explicitly set to local; using persist_directory=%s.", persist_directory)
+        return Chroma(
+            collection_name=collection_name,
+            embedding_function=embedding_function,
+            persist_directory=persist_directory,
+            create_collection_if_not_exists=create_collection_if_not_exists,
+        )
+
+    # storage_mode is "cloud"/"remote" OR "auto" with cloud credentials present.
+    # Either way: once cloud is configured, ALWAYS use it. No silent retry on
+    # a local store -- a quota/timeout/auth failure here must surface as a
+    # loud error, not quietly fork the data into a second, divergent index
+    # that only this one replica/process can see.
+    if storage_mode in {"cloud", "remote"} or cloud_ready:
         if not cloud_ready:
-            raise RuntimeError("Cloud Chroma storage requested, but CHROMA_API_KEY, CHROMA_TENANT, and CHROMA_DATABASE are not configured.")
+            raise RuntimeError(
+                "Cloud Chroma storage requested (CHROMA_STORAGE_MODE=cloud), but "
+                "CHROMA_API_KEY, CHROMA_TENANT, and CHROMA_DATABASE are not fully configured."
+            )
+        logger.info("Using Chroma Cloud (tenant=%s, database=%s).", chroma_tenant, chroma_database)
         return Chroma(
             collection_name=collection_name,
             embedding_function=embedding_function,
@@ -38,38 +56,18 @@ def create_chroma_store(
             create_collection_if_not_exists=create_collection_if_not_exists,
         )
 
-    if storage_mode in {"local", "persist", "filesystem"}:
-        return Chroma(
-            collection_name=collection_name,
-            embedding_function=embedding_function,
-            persist_directory=persist_directory,
-            create_collection_if_not_exists=create_collection_if_not_exists,
-        )
-
-    if cloud_ready:
-        try:
-            return Chroma(
-                collection_name=collection_name,
-                embedding_function=embedding_function,
-                chroma_cloud_api_key=chroma_api_key,
-                tenant=chroma_tenant,
-                database=chroma_database,
-                create_collection_if_not_exists=create_collection_if_not_exists,
-            )
-        except Exception as exc:
-            if _should_fallback_to_local(exc):
-                logger.warning("Cloud Chroma connection failed; falling back to local persistence.")
-            else:
-                raise
-
+    # No cloud credentials anywhere and no explicit mode -- genuine local dev.
+    # This is the ONLY path that reaches local persistence, and it's logged
+    # loudly (not swallowed) so nobody mistakes it for the cloud store.
+    logger.warning(
+        "No CHROMA_API_KEY/CHROMA_TENANT/CHROMA_DATABASE configured and "
+        "CHROMA_STORAGE_MODE is not 'cloud'; using local persistence at %s. "
+        "Set these env vars (or pass storage_mode='cloud') to use Chroma Cloud instead.",
+        persist_directory,
+    )
     return Chroma(
         collection_name=collection_name,
         embedding_function=embedding_function,
         persist_directory=persist_directory,
         create_collection_if_not_exists=create_collection_if_not_exists,
     )
-
-
-def _should_fallback_to_local(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return any(token in message for token in ["quota", "rate limit", "forbidden", "unauthorized", "timeout", "connect", "connection", "not found", "not available", "403", "401", "404", "500"])

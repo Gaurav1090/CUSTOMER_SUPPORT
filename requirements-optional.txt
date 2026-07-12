@@ -4,3 +4,9 @@ langchain-google-genai
 redis
 langfuse
 ragas
+
+# fsspec backends for the ingestion landing_path -- install only the one(s)
+# matching your cloud, not needed for local development:
+gcsfs   # gs://
+s3fs    # s3://
+adlfs   # abfs:// (Azure Data Lake)

@@ -8,12 +8,9 @@ from data_ingestion.ingestion_pipeline import DataIngestion
 class Phase1IngestionTests(unittest.TestCase):
     def test_chunk_documents_splits_and_preserves_metadata(self):
         ingestion = DataIngestion.__new__(DataIngestion)
-        ingestion.config = {
-            "ingestion": {
-                "chunk_size": 120,
-                "chunk_overlap": 20,
-            }
-        }
+        ingestion.config = {"ingestion": {"chunk_size": 120, "chunk_overlap": 20}}
+        ingestion.chunk_size = 120
+        ingestion.chunk_overlap = 20
 
         doc = Document(
             page_content="word " * 80,
