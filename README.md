@@ -218,6 +218,23 @@ way -- swapping it means re-ingesting into a new collection with matching
 vector dimensions (see the ingestion note further down), so that one
 stays a deliberate `config.yaml` edit.
 
+Example: switching to HuggingFace mid-session. Model availability on the
+router shifts over time (see the `huggingface` row below), so verify
+first with `curl -s https://router.huggingface.co/v1/models | jq '.data[].id'`
+-- these two were live and cheap at time of writing:
+
+```
+LLM_PROVIDER=huggingface
+LLM_MODEL_NAME=meta-llama/Llama-3.3-70B-Instruct
+LLM_REWRITE_MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct
+HF_TOKEN=your-token
+```
+
+`Llama-3.3-70B-Instruct` mirrors the current Groq default model for the
+main generation model; `Llama-3.1-8B-Instruct` is the cheapest/fastest
+option on the router for the query-rewrite model, same role
+`llama-3.1-8b-instant` plays on Groq.
+
 | `provider` | Applies to | Env var | Notes |
 |---|---|---|---|
 | `groq` | `llm` | `GROQ_API_KEY` | Fast, free tier -- but a **daily** token cap (100k TPD observed on `llama-3.3-70b-versatile`) that resets on a fixed daily cycle, not a rolling window. Automated testing burns through it fast. |
