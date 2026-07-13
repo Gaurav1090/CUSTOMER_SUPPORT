@@ -309,12 +309,33 @@ class DataIngestion:
             chroma_database=self.chroma_database,
             storage_mode=os.getenv("CHROMA_STORAGE_MODE", "auto"),
         )
-        inserted_ids = vstore.add_documents(new_documents, ids=new_ids)
 
-        upsert_index(self.bm25_index_uri, new_ids, new_documents)
+        # Chroma Cloud caps a single write at 300 records (see
+        # https://docs.trychroma.com/cloud/quotas-limits). Default to a
+        # margin below that in case a future record is larger than usual;
+        # override with CHROMA_UPSERT_BATCH_SIZE if you're on a plan with a
+        # different limit.
+        batch_size = int(os.getenv("CHROMA_UPSERT_BATCH_SIZE", "250"))
+        inserted_ids: List[str] = []
+        total = len(new_documents)
+        for start in range(0, total, batch_size):
+            batch_docs = new_documents[start : start + batch_size]
+            batch_ids = new_ids[start : start + batch_size]
 
-        processed_ids.update(new_ids)
-        state["processed_chunk_ids"] = sorted(processed_ids)
+            batch_inserted = vstore.add_documents(batch_docs, ids=batch_ids)
+            inserted_ids.extend(batch_inserted)
+
+            # Persist progress after every batch, not just at the end -- if
+            # a later batch hits a transient error (quota, timeout), the
+            # chunks already committed here are recorded as processed, so a
+            # re-run only retries what's actually left instead of redoing
+            # (and double-billing) the whole file.
+            upsert_index(self.bm25_index_uri, batch_ids, batch_docs)
+            processed_ids.update(batch_ids)
+            state["processed_chunk_ids"] = sorted(processed_ids)
+            self._save_state(state)
+            logger.info("Upserted batch: %d/%d chunks committed so far.", start + len(batch_ids), total)
+
         logger.info("Inserted %d new chunks into the vector store and BM25 index.", len(inserted_ids))
         return inserted_ids
 
