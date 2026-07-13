@@ -102,11 +102,27 @@ def strip_reasoning_tokens(output: str) -> str:
     return output.strip()
 
 
+_CITATION_BRACKET_RE = re.compile(r"\s*\[source:[^\]]+\]")
+
+
+def _strip_citations(answer: str) -> str:
+    """Drop [source:ID] markers before an answer is replayed back into a
+    future prompt as chat history. Otherwise a weaker model tends to copy a
+    source ID forward from a *previous* turn's answer and cite it against
+    the *current* turn's freshly retrieved (and likely different) context --
+    a fabricated-looking citation that _verify_citations then correctly
+    rejects, producing a false "Insufficient context" on a question the
+    model could otherwise have answered fine from history."""
+    return _CITATION_BRACKET_RE.sub("", answer)
+
+
 def _build_chat_history(session_id: str) -> str:
     history = session_store.get_recent(session_id, limit=4)
     if not history:
         return "No prior conversation."
-    return "\n".join(f"User: {item['user']}\nAssistant: {item['assistant']}" for item in history)
+    return "\n".join(
+        f"User: {item['user']}\nAssistant: {_strip_citations(item['assistant'])}" for item in history
+    )
 
 
 def _judge_groundedness(context: str, answer: str) -> bool:

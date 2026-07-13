@@ -2,7 +2,7 @@ import unittest
 
 from langchain_core.documents import Document
 
-from main import _verify_citations, strip_reasoning_tokens
+from main import _strip_citations, _verify_citations, strip_reasoning_tokens
 
 
 class Phase3GroundingTests(unittest.TestCase):
@@ -57,6 +57,28 @@ class CitationVerificationTests(unittest.TestCase):
         ]
         answer = "Great picks [source:row-1, source:row-2]."
         self.assertTrue(_verify_citations(answer, docs))
+
+
+class StripCitationsTests(unittest.TestCase):
+    def test_removes_single_citation_bracket(self):
+        answer = "Good bass and battery life [source:row-1]."
+        self.assertEqual(_strip_citations(answer), "Good bass and battery life.")
+
+    def test_removes_multiple_and_bundled_citation_brackets(self):
+        """Regression test: a prior turn's answer is replayed verbatim into
+        the next turn's chat history. If citation markers survive that
+        round-trip, a weaker model can copy a source ID forward and cite it
+        against the *current* turn's freshly retrieved (and likely
+        different) context -- a fabricated-looking citation that
+        _verify_citations then correctly rejects, producing a false
+        "Insufficient context" on a question the model could otherwise
+        have answered fine from history alone."""
+        answer = "Pick A [source:row-1] or pick B [source:row-2, source:row-3]."
+        self.assertEqual(_strip_citations(answer), "Pick A or pick B.")
+
+    def test_leaves_answer_with_no_citations_unchanged(self):
+        answer = "A generic answer with no citation."
+        self.assertEqual(_strip_citations(answer), answer)
 
 
 if __name__ == "__main__":
