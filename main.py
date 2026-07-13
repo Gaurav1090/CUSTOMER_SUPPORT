@@ -3,7 +3,6 @@ import os
 import re
 import secrets
 import time
-from collections import defaultdict
 
 import anyio
 import uvicorn
@@ -21,7 +20,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from retriever.retrieval import Retriever
 
 from utils.model_loader import ModelLoader
-from utils.ops import RateLimiter, RequestTrace, ResponseCache, build_langfuse_trace, new_request_id
+from utils.ops import RateLimiter, RequestTrace, ResponseCache, SessionStore, build_langfuse_trace, new_request_id
 
 from prompt_library.prompt import PROMPT_TEMPLATES
 
@@ -61,8 +60,7 @@ retriever_obj = Retriever()
 model_loader = ModelLoader()
 response_cache = ResponseCache()
 rate_limiter = RateLimiter()
-
-session_histories = defaultdict(list)
+session_store = SessionStore()
 
 
 @app.middleware("http")
@@ -105,10 +103,10 @@ def strip_reasoning_tokens(output: str) -> str:
 
 
 def _build_chat_history(session_id: str) -> str:
-    history = session_histories.get(session_id, [])
+    history = session_store.get_recent(session_id, limit=4)
     if not history:
         return "No prior conversation."
-    return "\n".join(f"User: {item['user']}\nAssistant: {item['assistant']}" for item in history[-4:])
+    return "\n".join(f"User: {item['user']}\nAssistant: {item['assistant']}" for item in history)
 
 
 def _judge_groundedness(context: str, answer: str) -> bool:
@@ -171,7 +169,7 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
             trace.finish("ok")
             if langfuse_trace:
                 langfuse_trace.update(output={"answer": cached.answer, "cache_hit": cached.hit_type})
-            session_histories[session_id].append({"user": query, "assistant": cached.answer})
+            session_store.append(session_id, query, cached.answer)
             return {
                 "answer": cached.answer,
                 "cache_hit": cached.hit_type,
@@ -214,7 +212,7 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         trace.add("groundedness_verdict", groundedness_verdict)
 
         response_cache.set(query, session_id, output, query_embedding=query_embedding)
-        session_histories[session_id].append({"user": query, "assistant": output})
+        session_store.append(session_id, query, output)
         trace.add("cache_hit", "miss")
         trace.finish("ok")
         if langfuse_trace:

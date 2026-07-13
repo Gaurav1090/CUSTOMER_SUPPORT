@@ -280,7 +280,7 @@ class Retriever:
         try:
             resolved_query = query
             if chat_history:
-                resolved_query = contextualize_query(query, chat_history, self._load_rewrite_llm())
+                resolved_query = contextualize_query(query, chat_history, self._load_rewrite_llm)
             self.last_standalone_query = resolved_query
 
             rewritten_query = self.rewrite_query(resolved_query)

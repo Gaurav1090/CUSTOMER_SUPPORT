@@ -45,29 +45,34 @@ class CacheResult:
     hit_type: str
 
 
+def _build_redis_client(purpose: str):
+    """Connect to REDIS_URL if set, else None (caller falls back to
+    in-memory). Shared by ResponseCache/RateLimiter/SessionStore so the
+    connect-and-log-loudly-on-failure behavior stays identical across all
+    three instead of drifting between copies."""
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        return None
+    try:
+        import redis
+
+        client = redis.Redis.from_url(redis_url, decode_responses=True)
+        client.ping()
+        logger.info("Redis %s connected.", purpose)
+        return client
+    except Exception:
+        logger.exception("Redis %s unavailable; falling back to in-memory %s.", purpose, purpose)
+        return None
+
+
 class ResponseCache:
     def __init__(self):
         self.enabled = os.getenv("CACHE_ENABLED", "true").lower() == "true"
         self.ttl_seconds = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
         self.semantic_threshold = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.92"))
-        self.redis = self._build_redis_client()
+        self.redis = _build_redis_client("cache")
         self.memory_exact: Dict[str, Dict[str, Any]] = {}
         self.memory_semantic: List[Dict[str, Any]] = []
-
-    def _build_redis_client(self):
-        redis_url = os.getenv("REDIS_URL")
-        if not redis_url:
-            return None
-        try:
-            import redis
-
-            client = redis.Redis.from_url(redis_url, decode_responses=True)
-            client.ping()
-            logger.info("Redis cache connected.")
-            return client
-        except Exception:
-            logger.exception("Redis cache unavailable; falling back to in-memory cache.")
-            return None
 
     def get_exact(self, query: str, session_id: str) -> Optional[CacheResult]:
         if not self.enabled:
@@ -120,7 +125,7 @@ class ResponseCache:
         }
 
         if self.redis:
-            self.redis.setex(f"rag:exact:{exact_key}", self.ttl_seconds, exact_payload)
+            self.redis.set(f"rag:exact:{exact_key}", exact_payload, ex=self.ttl_seconds)
             if query_embedding:
                 self.redis.lpush("rag:semantic:index", json.dumps(semantic_payload))
                 self.redis.ltrim("rag:semantic:index", 0, int(os.getenv("SEMANTIC_CACHE_MAX_ENTRIES", "500")) - 1)
@@ -155,23 +160,8 @@ class RateLimiter:
     def __init__(self):
         self.limit = int(os.getenv("RATE_LIMIT_REQUESTS", "30"))
         self.window_seconds = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
-        self.redis = self._build_redis_client()
+        self.redis = _build_redis_client("rate limiter")
         self.memory_hits: Dict[str, deque] = defaultdict(deque)
-
-    def _build_redis_client(self):
-        redis_url = os.getenv("REDIS_URL")
-        if not redis_url:
-            return None
-        try:
-            import redis
-
-            client = redis.Redis.from_url(redis_url, decode_responses=True)
-            client.ping()
-            logger.info("Redis rate limiter connected.")
-            return client
-        except Exception:
-            logger.exception("Redis rate limiter unavailable; falling back to in-memory limits.")
-            return None
 
     def allow(self, identity: str) -> bool:
         if self.limit <= 0:
@@ -192,6 +182,48 @@ class RateLimiter:
             return False
         hits.append(now)
         return True
+
+
+class SessionStore:
+    """Per-session chat history, Redis-backed with in-memory fallback --
+    same connect/degrade pattern as ResponseCache/RateLimiter. Redis-backed
+    so multi-turn history survives a process restart and stays consistent
+    if this ever runs as multiple replicas; the in-memory fallback keeps
+    history local to whichever process/replica handled each request, which
+    silently breaks multi-turn context the moment there's more than one."""
+
+    def __init__(self):
+        self.ttl_seconds = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
+        self.max_turns = int(os.getenv("SESSION_MAX_TURNS", "20"))
+        self.redis = _build_redis_client("session store")
+        self.memory: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+
+    def append(self, session_id: str, user: str, assistant: str) -> None:
+        turn = {"user": user, "assistant": assistant}
+
+        if self.redis:
+            key = f"rag:session:{session_id}"
+            self.redis.rpush(key, json.dumps(turn))
+            self.redis.ltrim(key, -self.max_turns, -1)
+            self.redis.expire(key, self.ttl_seconds)
+            return
+
+        history = self.memory[session_id]
+        history.append(turn)
+        del history[: -self.max_turns]
+
+    def get_recent(self, session_id: str, limit: int = 4) -> List[Dict[str, str]]:
+        if self.redis:
+            raw_entries = self.redis.lrange(f"rag:session:{session_id}", -limit, -1)
+            turns = []
+            for raw_entry in raw_entries:
+                try:
+                    turns.append(json.loads(raw_entry))
+                except json.JSONDecodeError:
+                    continue
+            return turns
+
+        return self.memory.get(session_id, [])[-limit:]
 
 
 @dataclass

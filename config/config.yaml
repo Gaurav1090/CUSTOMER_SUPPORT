@@ -1,4 +1,7 @@
 chroma:
+  # Back to the original collection -- matches the local HuggingFace
+  # embedding space below, and it's already fully populated (450 rows /
+  # 542 chunks) from before the Google detour, so no re-ingestion needed.
   collection_name: "ecommercedata"
 
 embedding_model:
@@ -46,6 +49,10 @@ retriever:
   rerank_relevance_floor: null
 
 llm:
+  # Provider/model_name are fully swappable -- see utils/model_loader.py
+  # for the groq/google/huggingface branches. Currently on Groq (fastest,
+  # most validated so far); revisit once quota/billing across providers is
+  # sorted out.
   provider: "groq"
   model_name: "llama-3.3-70b-versatile"
   # Small/fast model used only for conversational query rewriting -- not

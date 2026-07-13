@@ -58,13 +58,29 @@ class ModelLoader:
         try:
             provider = self.config["llm"]["provider"]
             model_name = model_name or self.config["llm"]["model_name"]
-
-            if provider != "groq":
-                raise ValueError(f"Unsupported LLM provider: {provider}")
-
-            env = self._get_required_env(["GROQ_API_KEY"])
             logger.info("Loading LLM provider=%s model=%s", provider, model_name)
-            groq_model=ChatGroq(model=model_name,api_key=env["GROQ_API_KEY"])
-            return groq_model
+
+            if provider == "groq":
+                env = self._get_required_env(["GROQ_API_KEY"])
+                return ChatGroq(model=model_name, api_key=env["GROQ_API_KEY"])
+
+            if provider == "google":
+                from langchain_google_genai import ChatGoogleGenerativeAI
+
+                self._get_required_env(["GOOGLE_API_KEY"])
+                return ChatGoogleGenerativeAI(model=model_name)
+
+            if provider == "huggingface":
+                from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+
+                env = self._get_required_env(["HF_TOKEN"])
+                endpoint = HuggingFaceEndpoint(
+                    repo_id=model_name,
+                    task="text-generation",
+                    huggingfacehub_api_token=env["HF_TOKEN"],
+                )
+                return ChatHuggingFace(llm=endpoint)
+
+            raise ValueError(f"Unsupported LLM provider: {provider}")
         except Exception as exc:
             raise RuntimeError("Failed to load LLM model.") from exc

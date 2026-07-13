@@ -15,6 +15,7 @@ uvicorn main:app --reload --port 8001
 Required environment variables:
 
 ```bash
+HF_TOKEN=
 GOOGLE_API_KEY=
 GROQ_API_KEY=
 COHERE_API_KEY=
@@ -29,6 +30,8 @@ CACHE_TTL_SECONDS=3600
 SEMANTIC_CACHE_THRESHOLD=0.92
 RATE_LIMIT_REQUESTS=30
 RATE_LIMIT_WINDOW_SECONDS=60
+SESSION_TTL_SECONDS=86400
+SESSION_MAX_TURNS=20
 LANGFUSE_PUBLIC_KEY=
 LANGFUSE_SECRET_KEY=
 ```
@@ -36,22 +39,48 @@ LANGFUSE_SECRET_KEY=
 `APP_API_KEY` must be sent to protected endpoints in the `X-API-Key` header.
 The browser UI prompts for this value and stores it in local storage.
 
+`REDIS_URL` backs three things -- response cache, rate limiting, and
+per-session chat history (`utils/ops.py: ResponseCache` / `RateLimiter` /
+`SessionStore`) -- all three fall back to an in-memory equivalent when it's
+unset, logged loudly when that happens. The in-memory fallback is fine for a
+single local process, but multi-turn chat history in particular only stays
+consistent as long as the same process/replica keeps handling that session.
+Managed Redis (e.g. GCP Memorystore) is typically only reachable from inside
+its VPC, not from an arbitrary dev machine -- test locally against a real
+Redis with `docker run -p 6379:6379 redis:7` and `REDIS_URL=redis://localhost:6379`,
+or run `python -m unittest tests.test_redis_backed` for fast dependency-free
+coverage against `fakeredis`.
+
 The chat UI uses `POST /get/stream` for SSE-style streamed responses. `POST
 /get` remains available for blocking clients. `GET /health` is a public
 liveness probe, and `GET /ready` checks required runtime configuration.
 
-`GOOGLE_API_KEY` is only required when `embedding_model.provider` is `google`.
-The default local embedding provider is HuggingFace:
+Current default (`config/config.yaml`): embeddings run locally via HuggingFace
+(`sentence-transformers/all-MiniLM-L6-v2`, no API key), and generation uses
+HuggingFace's free serverless Inference API (`HF_TOKEN` required, no billing
+account involved) as a stopgap while Groq's daily quota resets:
 
 ```yaml
 embedding_model:
   provider: "huggingface"
   model_name: "sentence-transformers/all-MiniLM-L6-v2"
+
+llm:
+  provider: "huggingface"
+  model_name: "microsoft/Phi-3-mini-4k-instruct"
+  rewrite_model_name: "microsoft/Phi-3-mini-4k-instruct"
 ```
 
+Other supported `provider` values, each requiring the matching API key:
+`llm.provider: "groq"` (`GROQ_API_KEY`) or `"google"` (`GOOGLE_API_KEY` --
+make sure the key's project has no billing account linked, or Gemini's
+free tier doesn't apply and calls fail with a "prepayment credits
+depleted" error instead); `embedding_model.provider: "google"`
+(`GOOGLE_API_KEY`).
+
 If you change embedding models after inserting documents into Chroma, use a new
-collection name or clear the old collection first. Different embedding models
-usually produce different vector dimensions.
+collection name or clear the old collection first -- different embedding models
+usually produce different vector dimensions and can't share a collection.
 
 `COHERE_API_KEY` enables semantic reranking (Cohere Rerank) of merged
 dense+BM25 candidates before generation. Without it, retrieval falls back to
