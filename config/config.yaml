@@ -53,6 +53,11 @@ llm:
   # for the groq/google/huggingface branches. Currently on Groq (fastest,
   # most validated so far); revisit once quota/billing across providers is
   # sorted out.
+  #
+  # Hit a rate limit / daily quota and need to switch providers right now
+  # without editing this file? Set env vars instead -- they take precedence
+  # over every value below: LLM_PROVIDER (groq|google|huggingface),
+  # LLM_MODEL_NAME, LLM_REWRITE_MODEL_NAME. See .env.example.
   provider: "groq"
   model_name: "llama-3.3-70b-versatile"
   # Small/fast model used only for conversational query rewriting -- not

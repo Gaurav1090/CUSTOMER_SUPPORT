@@ -207,6 +207,17 @@ Both are independently swappable in `config/config.yaml` via `utils/model_loader
 No code changes needed to switch -- just the config block and the matching
 env var.
 
+For the LLM specifically, you don't even need to edit `config.yaml`: set
+`LLM_PROVIDER` (`groq`/`google`/`huggingface`), `LLM_MODEL_NAME`, and/or
+`LLM_REWRITE_MODEL_NAME` in `.env` (see `.env.example`) and they take
+precedence over the config file. This is the fast path for hopping
+providers the moment you hit a rate limit or daily quota mid-session --
+just make sure the matching API key for whatever you switch to is also
+set. Embedding provider is deliberately **not** env-switchable the same
+way -- swapping it means re-ingesting into a new collection with matching
+vector dimensions (see the ingestion note further down), so that one
+stays a deliberate `config.yaml` edit.
+
 | `provider` | Applies to | Env var | Notes |
 |---|---|---|---|
 | `groq` | `llm` | `GROQ_API_KEY` | Fast, free tier -- but a **daily** token cap (100k TPD observed on `llama-3.3-70b-versatile`) that resets on a fixed daily cycle, not a rolling window. Automated testing burns through it fast. |

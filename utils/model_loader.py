@@ -54,10 +54,17 @@ class ModelLoader:
         Load and return the LLM model. Pass model_name to override the
         configured generation model, e.g. for a cheaper/faster model used
         for query rewriting rather than final answer generation.
+
+        LLM_PROVIDER / LLM_MODEL_NAME env vars take precedence over
+        config.yaml when set, so switching providers (e.g. after hitting a
+        rate limit) is a one-line env change instead of an edit + redeploy.
+        model_name passed explicitly by the caller still wins over
+        LLM_MODEL_NAME -- that path is for the distinct rewrite model, not
+        the main generation model this env var is meant to override.
         """
         try:
-            provider = self.config["llm"]["provider"]
-            model_name = model_name or self.config["llm"]["model_name"]
+            provider = os.getenv("LLM_PROVIDER", self.config["llm"]["provider"])
+            model_name = model_name or os.getenv("LLM_MODEL_NAME") or self.config["llm"]["model_name"]
             logger.info("Loading LLM provider=%s model=%s", provider, model_name)
 
             if provider == "groq":

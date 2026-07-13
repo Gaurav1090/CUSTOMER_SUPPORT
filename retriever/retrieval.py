@@ -223,7 +223,9 @@ class Retriever:
 
     def _load_rewrite_llm(self):
         if self._rewrite_llm is None:
-            rewrite_model_name = self.config.get("llm", {}).get("rewrite_model_name")
+            rewrite_model_name = os.getenv(
+                "LLM_REWRITE_MODEL_NAME", self.config.get("llm", {}).get("rewrite_model_name")
+            )
             self._rewrite_llm = self.model_loader.load_llm(model_name=rewrite_model_name)
         return self._rewrite_llm
 
