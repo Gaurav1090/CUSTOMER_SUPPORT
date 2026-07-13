@@ -20,7 +20,15 @@ from langchain_core.prompts import ChatPromptTemplate
 from retriever.retrieval import Retriever
 
 from utils.model_loader import ModelLoader
-from utils.ops import RateLimiter, RequestTrace, ResponseCache, SessionStore, build_langfuse_trace, new_request_id
+from utils.ops import (
+    RateLimiter,
+    RequestTrace,
+    ResponseCache,
+    SessionStore,
+    build_langfuse_trace,
+    finish_langfuse_trace,
+    new_request_id,
+)
 
 from prompt_library.prompt import PROMPT_TEMPLATES
 
@@ -190,8 +198,7 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         if cached:
             trace.add("cache_hit", cached.hit_type)
             trace.finish("ok")
-            if langfuse_trace:
-                langfuse_trace.update(output={"answer": cached.answer, "cache_hit": cached.hit_type})
+            finish_langfuse_trace(langfuse_trace, trace, output=cached.answer)
             session_store.append(session_id, query, cached.answer)
             return {
                 "answer": cached.answer,
@@ -238,14 +245,7 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         session_store.append(session_id, query, output)
         trace.add("cache_hit", "miss")
         trace.finish("ok")
-        if langfuse_trace:
-            langfuse_trace.update(
-                output={"answer": output},
-                metadata={
-                    "retrieved_source_ids": _source_ids(retrieved_documents),
-                    "cache_hit": "miss",
-                },
-            )
+        finish_langfuse_trace(langfuse_trace, trace, output=output)
         return {
             "answer": output,
             "cache_hit": "miss",
@@ -256,6 +256,7 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         raise
     except Exception as exc:
         trace.finish("error", error=str(exc))
+        finish_langfuse_trace(langfuse_trace, trace, error=str(exc))
         logger.exception("Failed to generate response.")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

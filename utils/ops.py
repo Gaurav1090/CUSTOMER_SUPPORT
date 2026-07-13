@@ -254,16 +254,66 @@ class RequestTrace:
 
 
 def build_langfuse_trace(trace: RequestTrace):
+    """Start a Langfuse span for this request, tagged with a trace ID
+    deterministically derived from our own request_id (so a RequestTrace
+    JSON log line and its Langfuse trace can be cross-referenced by that
+    ID). Returns None -- and the caller just skips Langfuse entirely --
+    when the keys aren't set or the SDK call fails for any reason,
+    including an incompatible langfuse-python version: the old `.trace()`
+    call this replaced was removed in the v3+ OpenTelemetry-based SDK
+    rewrite, which made every Langfuse call here silently no-op (caught by
+    this same except, span always None) on any langfuse>=3 install --
+    tracing looked wired up but nothing ever reached the dashboard."""
     if not os.getenv("LANGFUSE_PUBLIC_KEY") or not os.getenv("LANGFUSE_SECRET_KEY"):
         return None
     try:
         from langfuse import Langfuse
 
-        return Langfuse().trace(
-            id=trace.request_id,
+        client = Langfuse()
+        trace_id = client.create_trace_id(seed=trace.request_id)
+        return client.start_observation(
+            trace_context={"trace_id": trace_id},
             name="rag-chat",
+            as_type="span",
             input={"question": trace.question, "session_id": trace.session_id},
+            metadata={"session_id": trace.session_id},
         )
     except Exception:
         logger.exception("Langfuse trace initialization failed.")
         return None
+
+
+def finish_langfuse_trace(
+    span, trace: RequestTrace, output: Optional[str] = None, error: Optional[str] = None
+) -> None:
+    """Attach the final answer, the full RequestTrace event payload, and
+    the citation/groundedness verdicts as first-class Langfuse scores (so
+    they show up as chartable trend lines in the Langfuse dashboard --
+    e.g. "citation_check pass rate over the last 7 days" -- instead of
+    being buried, unqueryable, inside metadata JSON) before ending the
+    span. A no-op if span is None (Langfuse disabled/unavailable), and
+    never lets an observability failure break the actual response."""
+    if span is None:
+        return
+    try:
+        span.update(
+            output={"answer": output} if output is not None else None,
+            metadata=dict(trace.events),
+            level="ERROR" if error else "DEFAULT",
+            status_message=error,
+        )
+        if trace.events.get("citation_check") in ("passed", "failed"):
+            span.score(
+                name="citation_check",
+                value=1.0 if trace.events["citation_check"] == "passed" else 0.0,
+                data_type="BOOLEAN",
+            )
+        if trace.events.get("groundedness_verdict") in ("passed", "failed"):
+            span.score(
+                name="groundedness",
+                value=1.0 if trace.events["groundedness_verdict"] == "passed" else 0.0,
+                data_type="BOOLEAN",
+            )
+        span.end()
+    except Exception:
+        logger.exception("Failed to finalize Langfuse trace.")

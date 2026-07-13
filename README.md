@@ -281,14 +281,45 @@ external service: `python -m unittest tests.test_redis_backed -v` (uses
 `fakeredis`, an in-process Redis-protocol implementation -- validates real
 Redis command semantics, no network involved).
 
+### Production monitoring (Langfuse)
+
+Every single request -- not just eval runs -- already computes a hallucination
+signal per `main.py`'s `invoke_chain_details`: `citation_check` (did the
+answer cite a source_id that wasn't actually retrieved?) and
+`groundedness_verdict` (did the LLM-as-judge say the answer is supported by
+the retrieved context?), plus retrieval/generation latency and cache hit
+type. Setting `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` in `.env` sends all
+of that to [Langfuse](https://langfuse.com) (free Cloud tier or self-hosted)
+as a proper per-request trace, with `citation_check` and `groundedness`
+recorded as first-class Langfuse **scores** -- not just metadata -- so
+they're directly chartable in the Langfuse dashboard as trend lines (e.g.
+"groundedness pass rate over the last 7 days"). That trend is the actual
+answer to "is the app's quality degrading in production": a citation/
+groundedness pass-rate that's drifting down is the hallucination-rate signal,
+observable without waiting for the next `evaluation/run_evaluation.py` run.
+
+Each trace's ID is deterministically derived from the request's own
+`request_id` (`Langfuse.create_trace_id(seed=request_id)`), so a Langfuse
+trace can always be cross-referenced back to the matching `RequestTrace` JSON
+log line (see the "Structured request tracing" known limitation below --
+you need `logging.basicConfig()` configured for that log line to actually go
+anywhere).
+
+`utils/ops.py`'s `build_langfuse_trace`/`finish_langfuse_trace` use the
+OpenTelemetry-based span API from the Langfuse **v3+** SDK
+(`requirements-optional.txt` pins `langfuse>=3,<5`) -- the older `.trace()`
+call this replaced was removed in that rewrite and would silently no-op
+(caught by a broad `except`, span always `None`, nothing ever reaching the
+dashboard) on any modern `pip install langfuse`. Both helpers are fully
+optional: unset the two keys and every call becomes a no-op, same as today.
+
 ### Other env vars
 
 See `.env.example` for the full list with inline explanations: `CACHE_ENABLED`/
 `CACHE_TTL_SECONDS`/`SEMANTIC_CACHE_THRESHOLD`, `RATE_LIMIT_REQUESTS`/
 `RATE_LIMIT_WINDOW_SECONDS`, `SESSION_TTL_SECONDS`/`SESSION_MAX_TURNS`,
-`CHROMA_STORAGE_MODE`, `LANDING_PATH`/`INDEX_PATH` (ingestion source/state
-location -- can point at `gs://`/`s3://`/`abfs://` in prod), and optional
-Langfuse tracing (`LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`).
+`CHROMA_STORAGE_MODE`, and `LANDING_PATH`/`INDEX_PATH` (ingestion source/state
+location -- can point at `gs://`/`s3://`/`abfs://` in prod).
 
 ## Known limitations
 
