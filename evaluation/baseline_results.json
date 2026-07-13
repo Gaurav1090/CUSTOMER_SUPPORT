@@ -19,7 +19,7 @@
       "overall_score": 1.0,
       "category": "recommendation",
       "retrieved_count": 5,
-      "answer_length": 733
+      "answer_length": 650
     },
     {
       "question": "What are the best earbuds under 2000?",
@@ -30,17 +30,17 @@
       },
       "generation": {
         "faithfulness": 0.0,
-        "answer_relevance": 0.0,
+        "answer_relevance": 1.0,
         "expected_keywords": [
           "budget",
           "earbuds",
           "2000"
         ]
       },
-      "overall_score": 0.5,
+      "overall_score": 0.75,
       "category": "recommendation",
       "retrieved_count": 5,
-      "answer_length": 84
+      "answer_length": 702
     },
     {
       "question": "Tell me about wireless headsets with good battery life.",
@@ -49,11 +49,11 @@
         "context_recall": 0.0,
         "mrr": 0.0,
         "retrieved_source_ids": [
-          "flipkart_product_review.csv:row-119",
-          "flipkart_product_review.csv:row-140",
-          "flipkart_product_review.csv:row-58",
           "flipkart_product_review.csv:row-83",
-          "flipkart_product_review.csv:row-395"
+          "flipkart_product_review.csv:row-119",
+          "flipkart_product_review.csv:row-58",
+          "flipkart_product_review.csv:row-395",
+          "flipkart_product_review.csv:row-140"
         ],
         "expected_source_ids": [
           "flipkart_product_review.csv:row-246"
@@ -71,7 +71,7 @@
       "overall_score": 0.25,
       "category": "recommendation",
       "retrieved_count": 5,
-      "answer_length": 604
+      "answer_length": 793
     },
     {
       "question": "Which neckband is a good low-price option?",
@@ -80,11 +80,11 @@
         "context_recall": 0.0,
         "mrr": 0.0,
         "retrieved_source_ids": [
-          "flipkart_product_review.csv:row-375",
-          "flipkart_product_review.csv:row-392",
           "flipkart_product_review.csv:row-338",
           "flipkart_product_review.csv:row-396",
-          "flipkart_product_review.csv:row-352"
+          "flipkart_product_review.csv:row-375",
+          "flipkart_product_review.csv:row-352",
+          "flipkart_product_review.csv:row-392"
         ],
         "expected_source_ids": [
           "flipkart_product_review.csv:row-301"
@@ -101,7 +101,7 @@
       "overall_score": 0.125,
       "category": "recommendation",
       "retrieved_count": 5,
-      "answer_length": 245
+      "answer_length": 200
     },
     {
       "question": "Recommend wired headphones that are worth the money.",
@@ -111,27 +111,27 @@
         "mrr": 0.0,
         "retrieved_source_ids": [
           "flipkart_product_review.csv:row-405",
-          "flipkart_product_review.csv:row-127",
+          "flipkart_product_review.csv:row-302",
           "flipkart_product_review.csv:row-315",
           "flipkart_product_review.csv:row-381",
-          "flipkart_product_review.csv:row-302"
+          "flipkart_product_review.csv:row-127"
         ],
         "expected_source_ids": [
           "flipkart_product_review.csv:row-401"
         ]
       },
       "generation": {
-        "faithfulness": 0.0,
-        "answer_relevance": 0.0,
+        "faithfulness": 1.0,
+        "answer_relevance": 1.0,
         "expected_keywords": [
           "wired",
           "headphones"
         ]
       },
-      "overall_score": 0.0,
+      "overall_score": 0.5,
       "category": "recommendation",
       "retrieved_count": 5,
-      "answer_length": 84
+      "answer_length": 220
     },
     {
       "question": "What do people say about the realme Buds Q?",
@@ -140,10 +140,10 @@
         "context_recall": 0.0,
         "mrr": 0.0,
         "retrieved_source_ids": [
-          "flipkart_product_review.csv:row-204",
-          "flipkart_product_review.csv:row-364",
           "flipkart_product_review.csv:row-108",
           "flipkart_product_review.csv:row-8",
+          "flipkart_product_review.csv:row-364",
+          "flipkart_product_review.csv:row-204",
           "flipkart_product_review.csv:row-254"
         ],
         "expected_source_ids": [
@@ -161,7 +161,7 @@
       "overall_score": 0.25,
       "category": "product_lookup",
       "retrieved_count": 5,
-      "answer_length": 656
+      "answer_length": 636
     },
     {
       "question": "How does the BoAt Rockerz 235v2 compare to the OnePlus Bullets Wireless Z Bass Edition for sound quality?",
@@ -171,9 +171,9 @@
         "mrr": 0.0,
         "retrieved_source_ids": [
           "flipkart_product_review.csv:row-106",
-          "flipkart_product_review.csv:row-231",
           "flipkart_product_review.csv:row-40",
           "flipkart_product_review.csv:row-219",
+          "flipkart_product_review.csv:row-231",
           "flipkart_product_review.csv:row-115"
         ],
         "expected_source_ids": [
@@ -192,7 +192,7 @@
       "overall_score": 0.5,
       "category": "comparison",
       "retrieved_count": 5,
-      "answer_length": 709
+      "answer_length": 771
     },
     {
       "question": "Show me headphones with rating>=4",
@@ -211,7 +211,7 @@
       "overall_score": 0.75,
       "category": "metadata_filter",
       "retrieved_count": 5,
-      "answer_length": 1129
+      "answer_length": 758
     },
     {
       "question": "What is your return policy?",
@@ -230,7 +230,7 @@
       "overall_score": 0.75,
       "category": "out_of_scope",
       "retrieved_count": 5,
-      "answer_length": 325
+      "answer_length": 170
     },
     {
       "question": "Can you track my order #12345?",
@@ -291,10 +291,10 @@
     }
   ],
   "statistics": {
-    "mean_score": 0.5104166666666666,
-    "min_score": 0.0,
+    "mean_score": 0.5729166666666666,
+    "min_score": 0.125,
     "max_score": 1.0,
-    "passed": 5,
+    "passed": 6,
     "total": 12
   }
 }

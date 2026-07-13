@@ -23,10 +23,31 @@ ingestion:
   legacy_csv_path: "data/flipkart_product_review.csv"
 
 retriever:
+  # Dense/BM25 candidate pool fetched before merge+rerank when there is no
+  # semantic reranker to sort them out (COHERE_API_KEY unset). Deliberately
+  # narrow -- the lexical term-overlap fallback reranker is crude, and a
+  # wider pool just gives it more chances to rank an irrelevant-but-
+  # lexically-similar document above the genuinely relevant one.
   top_k: 10
+  # Wider candidate pool used only when Cohere Rerank is actually active --
+  # a real semantic reranker benefits from more candidates to choose from,
+  # unlike the lexical fallback above.
+  rerank_candidate_top_k: 20
   hybrid: true
+  # Final number of documents kept after reranking, passed to generation.
   rerank_top_k: 5
+  # Cohere Rerank model used when COHERE_API_KEY is configured. Falls back
+  # to lexical term-overlap reranking (utils in retriever/retrieval.py) when
+  # unset -- logged loudly, never silent.
+  rerank_model: "rerank-english-v3.0"
+  # Optional minimum Cohere relevance score (0-1) a candidate must clear to
+  # be kept. Unset (null) = no floor, keep top rerank_top_k regardless of
+  # score.
+  rerank_relevance_floor: null
 
 llm:
   provider: "groq"
   model_name: "llama-3.3-70b-versatile"
+  # Small/fast model used only for conversational query rewriting -- not
+  # the final answer, so it doesn't need the larger model's quality.
+  rewrite_model_name: "llama-3.1-8b-instant"

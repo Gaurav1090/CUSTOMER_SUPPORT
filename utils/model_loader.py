@@ -49,13 +49,15 @@ class ModelLoader:
         except Exception as exc:
             raise RuntimeError("Failed to load embedding model.") from exc
 
-    def load_llm(self):
+    def load_llm(self, model_name: str = None):
         """
-        Load and return the LLM model.
+        Load and return the LLM model. Pass model_name to override the
+        configured generation model, e.g. for a cheaper/faster model used
+        for query rewriting rather than final answer generation.
         """
         try:
             provider = self.config["llm"]["provider"]
-            model_name=self.config["llm"]["model_name"]
+            model_name = model_name or self.config["llm"]["model_name"]
 
             if provider != "groq":
                 raise ValueError(f"Unsupported LLM provider: {provider}")

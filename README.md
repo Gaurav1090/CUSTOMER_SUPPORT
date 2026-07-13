@@ -17,6 +17,7 @@ Required environment variables:
 ```bash
 GOOGLE_API_KEY=
 GROQ_API_KEY=
+COHERE_API_KEY=
 CHROMA_API_KEY=
 CHROMA_TENANT=
 CHROMA_DATABASE=
@@ -51,6 +52,10 @@ embedding_model:
 If you change embedding models after inserting documents into Chroma, use a new
 collection name or clear the old collection first. Different embedding models
 usually produce different vector dimensions.
+
+`COHERE_API_KEY` enables semantic reranking (Cohere Rerank) of merged
+dense+BM25 candidates before generation. Without it, retrieval falls back to
+lexical term-overlap reranking and logs a warning on every query.
 
 ## Production Readiness Roadmap
 

@@ -120,13 +120,32 @@ def _judge_groundedness(context: str, answer: str) -> bool:
 
 
 def _build_context_text(retrieved_documents):
+    # Delimited so the model can distinguish retrieved (untrusted,
+    # user-generated) review text from its own instructions -- see the
+    # product_bot prompt's injection-defense line.
     return "\n\n".join(
-        f"- {doc.page_content} [source:{doc.metadata.get('source_id', 'unknown')}]" for doc in retrieved_documents
+        f'<doc source="{doc.metadata.get("source_id", "unknown")}">{doc.page_content}</doc>'
+        for doc in retrieved_documents
     )
 
 
 def _source_ids(retrieved_documents):
     return [doc.metadata.get("source_id", "unknown") for doc in retrieved_documents]
+
+
+_CITATION_RE = re.compile(r"\[source:([^\]]+)\]")
+
+
+def _verify_citations(answer: str, retrieved_documents) -> bool:
+    """False only if the answer cites a source_id that wasn't actually
+    retrieved -- a fabricated citation, and a stronger hallucination signal
+    than the LLM groundedness judge alone. An answer with no citations at
+    all isn't flagged here; that's the judge's job."""
+    cited_ids = set(_CITATION_RE.findall(answer))
+    if not cited_ids:
+        return True
+    valid_ids = set(_source_ids(retrieved_documents))
+    return cited_ids.issubset(valid_ids)
 
 
 def _embed_query(query: str):
@@ -160,13 +179,15 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
                 "request_id": request_id,
             }
 
+        chat_history = _build_chat_history(session_id)
+
         retrieval_start = time.time()
-        retrieved_documents = retriever_obj.call_retriever(query)
+        retrieved_documents = retriever_obj.call_retriever(query, chat_history=chat_history)
         trace.add("retrieval_latency_ms", int((time.time() - retrieval_start) * 1000))
+        trace.add("standalone_query", retriever_obj.last_standalone_query)
         trace.add("retrieved_source_ids", _source_ids(retrieved_documents))
 
         context_text = _build_context_text(retrieved_documents)
-        chat_history = _build_chat_history(session_id)
         prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATES["product_bot"])
         llm = model_loader.load_llm()
 
@@ -176,10 +197,21 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         trace.add("generation_latency_ms", int((time.time() - generation_start) * 1000))
         output = strip_reasoning_tokens(output)
 
+        citation_check = "skipped_no_context"
+        groundedness_verdict = "skipped_no_context"
         if not retrieved_documents:
             output = "Insufficient context. Please provide more details about the product or issue."
-        elif not _judge_groundedness(context_text, output):
-            output = "Insufficient context. I cannot confidently answer from the retrieved evidence alone."
+        else:
+            citation_check = "passed" if _verify_citations(output, retrieved_documents) else "failed"
+            if citation_check == "failed":
+                output = "Insufficient context. I cannot confidently answer from the retrieved evidence alone."
+                groundedness_verdict = "skipped_citation_failed"
+            else:
+                groundedness_verdict = "passed" if _judge_groundedness(context_text, output) else "failed"
+                if groundedness_verdict == "failed":
+                    output = "Insufficient context. I cannot confidently answer from the retrieved evidence alone."
+        trace.add("citation_check", citation_check)
+        trace.add("groundedness_verdict", groundedness_verdict)
 
         response_cache.set(query, session_id, output, query_embedding=query_embedding)
         session_histories[session_id].append({"user": query, "assistant": output})

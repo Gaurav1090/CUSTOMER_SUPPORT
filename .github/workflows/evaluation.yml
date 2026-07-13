@@ -33,11 +33,14 @@ jobs:
           CHROMA_API_KEY: ${{ secrets.CHROMA_API_KEY }}
           CHROMA_TENANT: ${{ secrets.CHROMA_TENANT }}
           CHROMA_DATABASE: ${{ secrets.CHROMA_DATABASE }}
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
         run: |
           # Run all unit tests from the 'tests' directory
           python -m unittest discover tests -p "test_phase*.py" -v
 
-          # Generate the full evaluation report for artifacts
+          # Generate the full evaluation report for artifacts. Fails the
+          # build (non-zero exit) if mean_score regresses beyond tolerance
+          # against evaluation/baseline_results.json.
           python -m evaluation.run_evaluation
       
       - name: Upload evaluation results
