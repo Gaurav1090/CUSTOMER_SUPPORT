@@ -98,6 +98,18 @@ class DataIngestion:
         logger.info("Landing path has %d files, %d new/changed.", len(all_files), len(new_or_changed))
         return new_or_changed
 
+    def _dispatch_loader(self, uri: str) -> List[Document]:
+        """Route a landing file to the right loader by extension. Add a new
+        branch here (plus the matching suffix in config.yaml's
+        supported_extensions) whenever a new format needs support."""
+        lower_uri = uri.lower()
+        if lower_uri.endswith(".pdf"):
+            return self._load_pdf_documents(uri)
+        if lower_uri.endswith(".csv"):
+            return self._load_csv_documents(uri)
+        logger.warning("No loader registered for %s; skipping.", uri)
+        return []
+
     def _load_pdf_documents(self, uri: str) -> List[Document]:
         """Extract per-page text from a PDF in the landing storage. Returns
         one Document per non-empty page; downstream chunking splits further."""
@@ -135,9 +147,67 @@ class DataIngestion:
             )
         return documents
 
+    _REVIEW_COLUMNS = {"product_title", "rating", "summary", "review"}
+
+    def _documents_from_dataframe(self, df: "pd.DataFrame", source_file: str, source_uri: str) -> List[Document]:
+        """Turn a CSV's rows into Documents. Recognizes the review-style
+        schema (product_title/rating/summary/review) used by the bundled
+        demo dataset and gives it structured metadata for the rating/price
+        filters in retriever/retrieval.py. Any other CSV shape falls back to
+        a generic "flatten every column into text" row, so an arbitrary CSV
+        dropped in the landing folder still ingests instead of erroring out."""
+        documents: List[Document] = []
+        is_review_style = self._REVIEW_COLUMNS.issubset(set(df.columns))
+
+        for index, row in df.iterrows():
+            source_id = f"{source_file}:row-{index + 1}"
+            if is_review_style:
+                metadata: Dict[str, Any] = {
+                    "product_name": row.get("product_title"),
+                    "product_rating": row.get("rating"),
+                    "product_summary": row.get("summary"),
+                    "source_row": int(index + 1),
+                    "source_file": source_file,
+                    "source_uri": source_uri,
+                    "source_id": source_id,
+                    "modality": "text",
+                }
+                for optional_field in ("price", "category", "brand"):
+                    metadata[optional_field] = row.get(optional_field) if optional_field in row.index else None
+                page_content = clean_text(str(row.get("review", "")))
+            else:
+                metadata = {
+                    "source_row": int(index + 1),
+                    "source_file": source_file,
+                    "source_uri": source_uri,
+                    "source_id": source_id,
+                    "modality": "text",
+                }
+                page_content = clean_text(", ".join(f"{col}: {row[col]}" for col in df.columns))
+
+            if page_content:
+                documents.append(Document(page_content=page_content, metadata=metadata))
+        return documents
+
+    def _load_csv_documents(self, uri: str) -> List[Document]:
+        """Any CSV dropped in the landing folder -- not just the bundled
+        demo file. Same object-store read path as PDFs, so this works
+        identically whether landing_path is local or gs://\\s3://\\abfs://."""
+        try:
+            raw_bytes = read_bytes(uri)
+            df = pd.read_csv(io.BytesIO(raw_bytes))
+        except Exception:
+            logger.exception("Failed to read CSV %s; skipping.", uri)
+            return []
+        source_file = uri.rsplit("/", 1)[-1]
+        return self._documents_from_dataframe(df, source_file, uri)
+
     def _load_legacy_csv_documents(self) -> List[Document]:
-        """The original Flipkart review CSV, kept only for the bundled demo /
-        tests. New content should land as PDFs in landing_path instead."""
+        """The original Flipkart review CSV at a fixed path, kept only for
+        the bundled demo / tests -- gated by INGEST_LEGACY_CSV, separate
+        from the landing folder scan. Prefer dropping CSVs into
+        landing_path instead; that path is picked up automatically and
+        tracked incrementally like everything else."""
         csv_path = self.config.get("ingestion", {}).get("legacy_csv_path", "data/flipkart_product_review.csv")
         if not os.path.exists(csv_path):
             return []
@@ -145,22 +215,7 @@ class DataIngestion:
         expected_columns = {"product_title", "rating", "summary", "review"}
         if not expected_columns.issubset(set(df.columns)):
             raise ValueError(f"CSV must contain columns: {expected_columns}")
-
-        documents: List[Document] = []
-        for index, row in df.iterrows():
-            metadata: Dict[str, Any] = {
-                "product_name": row.get("product_title"),
-                "product_rating": row.get("rating"),
-                "product_summary": row.get("summary"),
-                "source_row": int(index + 1),
-                "source_file": os.path.basename(csv_path),
-                "source_id": f"row-{index + 1}",
-                "modality": "text",
-            }
-            for optional_field in ("price", "category", "brand"):
-                metadata[optional_field] = row.get(optional_field) if optional_field in row.index else None
-            documents.append(Document(page_content=clean_text(str(row.get("review", ""))), metadata=metadata))
-        return documents
+        return self._documents_from_dataframe(df, os.path.basename(csv_path), csv_path)
 
     # ------------------------------------------------------------ chunking
 
@@ -271,7 +326,7 @@ class DataIngestion:
         new_files = self._discover_new_files(state)
         documents: List[Document] = []
         for uri in new_files:
-            documents.extend(self._load_pdf_documents(uri))
+            documents.extend(self._dispatch_loader(uri))
 
         if include_legacy_csv:
             documents.extend(self._load_legacy_csv_documents())

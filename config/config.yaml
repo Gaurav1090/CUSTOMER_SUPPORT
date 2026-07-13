@@ -18,7 +18,7 @@ ingestion:
   # landing path, so a fresh ingestion job container has no local state to
   # lose.
   index_path: "data/landing/_index"
-  supported_extensions: [".pdf"]
+  supported_extensions: [".pdf", ".csv"]
   # Legacy CSV path, kept for the bundled demo dataset / tests only.
   legacy_csv_path: "data/flipkart_product_review.csv"
 

@@ -16,4 +16,3 @@ data/landing/*
 .terraform
 .terraform.lock.hcl
 .terraform.*
-.DS_Store
