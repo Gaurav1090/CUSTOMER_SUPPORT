@@ -131,7 +131,14 @@ def _source_ids(retrieved_documents):
     return [doc.metadata.get("source_id", "unknown") for doc in retrieved_documents]
 
 
-_CITATION_RE = re.compile(r"\[source:([^\]]+)\]")
+# Matches each individual "source:ID" token rather than a whole [...]
+# bracket, since some models (observed on Llama-3.3-70B-Instruct via the
+# HuggingFace router) bundle several citations supporting one claim into a
+# single bracket -- "[source:A, source:B]" -- instead of the one-per-bracket
+# form the prompt asks for. Anchoring on the bracket pair alone would treat
+# that whole bundled string as one fabricated ID and fail a fully-grounded
+# answer.
+_CITATION_RE = re.compile(r"source:\s*([^\],\s]+)")
 
 
 def _verify_citations(answer: str, retrieved_documents) -> bool:

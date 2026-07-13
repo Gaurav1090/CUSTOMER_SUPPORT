@@ -46,6 +46,18 @@ class CitationVerificationTests(unittest.TestCase):
         answer = "See [source:row-1] and also [source:row-404]."
         self.assertFalse(_verify_citations(answer, docs))
 
+    def test_passes_when_multiple_citations_are_bundled_in_one_bracket(self):
+        """Regression test: some models (observed on Llama-3.3-70B-Instruct
+        via the HuggingFace router) bundle several citations into a single
+        bracket -- "[source:A, source:B]" -- instead of one bracket per
+        citation. That must not be treated as one fabricated combined ID."""
+        docs = [
+            Document(page_content="x", metadata={"source_id": "row-1"}),
+            Document(page_content="y", metadata={"source_id": "row-2"}),
+        ]
+        answer = "Great picks [source:row-1, source:row-2]."
+        self.assertTrue(_verify_citations(answer, docs))
+
 
 if __name__ == "__main__":
     unittest.main()
