@@ -45,6 +45,56 @@ class CacheResult:
     hit_type: str
 
 
+_nli_model = None
+_nli_model_load_failed = False
+
+
+def _get_nli_model():
+    """Lazily load a single shared CrossEncoder NLI model for the process
+    lifetime (unlike utils/model_loader.py's LLM, this one has no reason to
+    be swappable per-request, so a module-level singleton is correct here --
+    reloading it per call would be the same per-request-instantiation
+    mistake found in build_langfuse_trace())."""
+    global _nli_model, _nli_model_load_failed
+    if _nli_model is not None or _nli_model_load_failed:
+        return _nli_model
+    try:
+        from sentence_transformers import CrossEncoder
+
+        model_name = os.getenv("SEMANTIC_CACHE_NLI_MODEL", "cross-encoder/nli-deberta-v3-small")
+        _nli_model = CrossEncoder(model_name)
+        logger.info("Semantic cache NLI model loaded: %s", model_name)
+    except Exception:
+        logger.exception("Failed to load semantic cache NLI model; semantic cache disabled.")
+        _nli_model_load_failed = True
+    return _nli_model
+
+
+def _is_paraphrase(cached_query: str, incoming_query: str) -> bool:
+    """True only if incoming_query is a reworded restatement of cached_query,
+    not merely topically similar and not a negated/opposite question.
+
+    Cosine similarity on sentence embeddings can't tell these apart -- e.g.
+    on all-MiniLM-L6-v2, "good battery life" vs "poor battery life" scores
+    *higher* (~0.97) than a genuine paraphrase (~0.89), because negation
+    barely shifts embedding space. An NLI cross-encoder is used instead:
+    require entailment forward (cached -> incoming) and no contradiction
+    reverse (incoming -> cached). Both checks are needed -- on the "is it
+    worth buying" / "is it not worth buying" pair, the reverse direction
+    alone gave a weak, ambiguous entailment signal, but the forward
+    direction correctly flagged contradiction.
+    """
+    nli = _get_nli_model()
+    if nli is None:
+        return False
+
+    labels = nli.config.id2label
+    scores = nli.predict([(cached_query, incoming_query), (incoming_query, cached_query)])
+    forward_label = labels[int(scores[0].argmax())]
+    reverse_label = labels[int(scores[1].argmax())]
+    return forward_label == "entailment" and reverse_label != "contradiction"
+
+
 def _build_redis_client(purpose: str):
     """Connect to REDIS_URL if set, else None (caller falls back to
     in-memory). Shared by ResponseCache/RateLimiter/SessionStore so the
@@ -69,7 +119,14 @@ class ResponseCache:
     def __init__(self):
         self.enabled = os.getenv("CACHE_ENABLED", "true").lower() == "true"
         self.ttl_seconds = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
-        self.semantic_threshold = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.92"))
+        # Cheap cosine pre-filter only -- NOT the final hit decision. Cosine
+        # similarity alone can't separate paraphrases from negated opposites
+        # (see _is_paraphrase), so this just narrows candidates worth the
+        # more expensive NLI check. Genuine paraphrases measured ~0.89 on
+        # all-MiniLM-L6-v2 vs ~0.55-0.64 for same-product-different-feature
+        # questions, so 0.80 comfortably keeps the former as candidates
+        # while skipping NLI on the latter.
+        self.semantic_candidate_threshold = float(os.getenv("SEMANTIC_CACHE_CANDIDATE_THRESHOLD", "0.80"))
         self.redis = _build_redis_client("cache")
         self.memory_exact: Dict[str, Dict[str, Any]] = {}
         self.memory_semantic: List[Dict[str, Any]] = []
@@ -91,23 +148,28 @@ class ResponseCache:
         self.memory_exact.pop(key, None)
         return None
 
-    def get_semantic(self, query_embedding: List[float], session_id: str) -> Optional[CacheResult]:
+    def get_semantic(self, query: str, query_embedding: List[float], session_id: str) -> Optional[CacheResult]:
         if not self.enabled or not query_embedding:
             return None
 
         entries = self._semantic_entries()
-        best_answer = None
-        best_score = 0.0
+        candidates = []
         for entry in entries:
             if entry.get("session_id") != session_id:
                 continue
             score = cosine_similarity(query_embedding, entry.get("embedding", []))
-            if score > best_score:
-                best_score = score
-                best_answer = entry.get("answer")
+            if score >= self.semantic_candidate_threshold:
+                candidates.append((score, entry))
+        candidates.sort(key=lambda pair: pair[0], reverse=True)
 
-        if best_answer and best_score >= self.semantic_threshold:
-            return CacheResult(answer=best_answer, hit_type="semantic")
+        # Cosine similarity alone can rank a negated opposite above a real
+        # paraphrase (see _is_paraphrase), so every candidate must also pass
+        # the NLI entailment gate -- highest-cosine first, first pass wins.
+        max_candidates = int(os.getenv("SEMANTIC_CACHE_MAX_NLI_CHECKS", "5"))
+        for _, entry in candidates[:max_candidates]:
+            cached_query = entry.get("query", "")
+            if cached_query and _is_paraphrase(cached_query, query):
+                return CacheResult(answer=entry.get("answer"), hit_type="semantic")
         return None
 
     def set(self, query: str, session_id: str, answer: str, query_embedding: Optional[List[float]] = None) -> None:
@@ -253,6 +315,29 @@ class RequestTrace:
         logger.info(json.dumps(payload, default=str))
 
 
+_langfuse_client = None
+_langfuse_client_init_failed = False
+
+
+def _get_langfuse_client():
+    """Lazily build a single shared Langfuse client for the process
+    lifetime. Constructing Langfuse() sets up its OTel exporter/tracer
+    provider, which measured ~5.9s when done per-request -- trivial next
+    to a normal 8-18s retrieval+generation request, but it was the
+    dominant cost on a cache hit, where everything else is skipped."""
+    global _langfuse_client, _langfuse_client_init_failed
+    if _langfuse_client is not None or _langfuse_client_init_failed:
+        return _langfuse_client
+    try:
+        from langfuse import Langfuse
+
+        _langfuse_client = Langfuse()
+    except Exception:
+        logger.exception("Langfuse client initialization failed.")
+        _langfuse_client_init_failed = True
+    return _langfuse_client
+
+
 def build_langfuse_trace(trace: RequestTrace):
     """Start a Langfuse span for this request, tagged with a trace ID
     deterministically derived from our own request_id (so a RequestTrace
@@ -267,9 +352,9 @@ def build_langfuse_trace(trace: RequestTrace):
     if not os.getenv("LANGFUSE_PUBLIC_KEY") or not os.getenv("LANGFUSE_SECRET_KEY"):
         return None
     try:
-        from langfuse import Langfuse
-
-        client = Langfuse()
+        client = _get_langfuse_client()
+        if client is None:
+            return None
         trace_id = client.create_trace_id(seed=trace.request_id)
         return client.start_observation(
             trace_context={"trace_id": trace_id},

@@ -1,6 +1,7 @@
 import os
 import unittest
 from collections import defaultdict, deque
+from unittest.mock import patch
 
 import fakeredis
 
@@ -15,7 +16,7 @@ def _make_response_cache(redis_client):
     cache = ResponseCache.__new__(ResponseCache)
     cache.enabled = True
     cache.ttl_seconds = 3600
-    cache.semantic_threshold = 0.92
+    cache.semantic_candidate_threshold = 0.80
     cache.redis = redis_client
     cache.memory_exact = {}
     cache.memory_semantic = []
@@ -66,21 +67,40 @@ class ResponseCacheRedisTests(unittest.TestCase):
         key = f"rag:exact:{cache_key('cheap earbuds', 's1')}"
         self.assertGreater(self.redis.ttl(key), 0)
 
-    def test_semantic_cache_hit_above_threshold(self):
+    @patch("utils.ops._is_paraphrase", return_value=True)
+    def test_semantic_cache_hit_when_cosine_and_nli_both_agree(self, mock_is_paraphrase):
         self.cache.set("cheap earbuds", "s1", "answer", query_embedding=[1.0, 0.0, 0.0])
-        result = self.cache.get_semantic([1.0, 0.0, 0.0], "s1")
+        result = self.cache.get_semantic("affordable earbuds", [1.0, 0.0, 0.0], "s1")
         self.assertIsNotNone(result)
         self.assertEqual(result.hit_type, "semantic")
+        mock_is_paraphrase.assert_called_once_with("cheap earbuds", "affordable earbuds")
 
-    def test_semantic_cache_miss_below_threshold(self):
+    def test_semantic_cache_miss_below_candidate_threshold(self):
+        # Orthogonal embeddings -> cosine 0.0, well below the candidate
+        # floor, so this should never even reach the NLI check.
         self.cache.set("cheap earbuds", "s1", "answer", query_embedding=[1.0, 0.0, 0.0])
-        result = self.cache.get_semantic([0.0, 1.0, 0.0], "s1")
+        with patch("utils.ops._is_paraphrase") as mock_is_paraphrase:
+            result = self.cache.get_semantic("unrelated question", [0.0, 1.0, 0.0], "s1")
         self.assertIsNone(result)
+        mock_is_paraphrase.assert_not_called()
 
-    def test_semantic_cache_scoped_to_session(self):
-        self.cache.set("cheap earbuds", "s1", "answer", query_embedding=[1.0, 0.0, 0.0])
-        result = self.cache.get_semantic([1.0, 0.0, 0.0], "s2")
+    @patch("utils.ops._is_paraphrase", return_value=False)
+    def test_semantic_cache_miss_when_nli_rejects_high_cosine_candidate(self, mock_is_paraphrase):
+        # Same embedding (cosine 1.0) simulates a negated-opposite question
+        # that happens to score high on cosine similarity -- the NLI gate
+        # (mocked here to reject, as the real one does for negation pairs)
+        # must still block the hit.
+        self.cache.set("good battery life", "s1", "answer", query_embedding=[1.0, 0.0, 0.0])
+        result = self.cache.get_semantic("poor battery life", [1.0, 0.0, 0.0], "s1")
         self.assertIsNone(result)
+        mock_is_paraphrase.assert_called_once_with("good battery life", "poor battery life")
+
+    @patch("utils.ops._is_paraphrase", return_value=True)
+    def test_semantic_cache_scoped_to_session(self, mock_is_paraphrase):
+        self.cache.set("cheap earbuds", "s1", "answer", query_embedding=[1.0, 0.0, 0.0])
+        result = self.cache.get_semantic("cheap earbuds", [1.0, 0.0, 0.0], "s2")
+        self.assertIsNone(result)
+        mock_is_paraphrase.assert_not_called()
 
 
 class RateLimiterRedisTests(unittest.TestCase):

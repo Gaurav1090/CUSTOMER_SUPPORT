@@ -32,7 +32,14 @@ from utils.ops import (
 
 from prompt_library.prompt import PROMPT_TEMPLATES
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
+
+INSUFFICIENT_CONTEXT_NO_DOCS = "Insufficient context. Please provide more details about the product or issue."
+INSUFFICIENT_CONTEXT_UNGROUNDED = "Insufficient context. I cannot confidently answer from the retrieved evidence alone."
 
 load_dotenv()
 
@@ -194,7 +201,7 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         query_embedding = _embed_query(query)
         cached = response_cache.get_exact(query, session_id)
         if not cached and query_embedding:
-            cached = response_cache.get_semantic(query_embedding, session_id)
+            cached = response_cache.get_semantic(query, query_embedding, session_id)
         if cached:
             trace.add("cache_hit", cached.hit_type)
             trace.finish("ok")
@@ -228,20 +235,26 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         citation_check = "skipped_no_context"
         groundedness_verdict = "skipped_no_context"
         if not retrieved_documents:
-            output = "Insufficient context. Please provide more details about the product or issue."
+            output = INSUFFICIENT_CONTEXT_NO_DOCS
         else:
             citation_check = "passed" if _verify_citations(output, retrieved_documents) else "failed"
             if citation_check == "failed":
-                output = "Insufficient context. I cannot confidently answer from the retrieved evidence alone."
+                output = INSUFFICIENT_CONTEXT_UNGROUNDED
                 groundedness_verdict = "skipped_citation_failed"
             else:
                 groundedness_verdict = "passed" if _judge_groundedness(context_text, output) else "failed"
                 if groundedness_verdict == "failed":
-                    output = "Insufficient context. I cannot confidently answer from the retrieved evidence alone."
+                    output = INSUFFICIENT_CONTEXT_UNGROUNDED
         trace.add("citation_check", citation_check)
         trace.add("groundedness_verdict", groundedness_verdict)
 
-        response_cache.set(query, session_id, output, query_embedding=query_embedding)
+        # Don't cache a refusal -- citation/groundedness failures are often
+        # transient (LLM sampling variance on retry), and caching one would
+        # make it "sticky" for the full TTL: every repeat or paraphrase of
+        # a genuinely answerable question would keep getting refused until
+        # expiry, even though a fresh retry could well succeed.
+        if output not in (INSUFFICIENT_CONTEXT_NO_DOCS, INSUFFICIENT_CONTEXT_UNGROUNDED):
+            response_cache.set(query, session_id, output, query_embedding=query_embedding)
         session_store.append(session_id, query, output)
         trace.add("cache_hit", "miss")
         trace.finish("ok")
