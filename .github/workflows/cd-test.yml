@@ -11,10 +11,19 @@ jobs:
   build:
     needs: tests
     uses: ./.github/workflows/_reusable-build.yml
+    # Reusable workflows can only request permissions the caller grants --
+    # _reusable-build.yml's job needs id-token: write for WIF auth, so it
+    # must be explicitly granted here, not just inside the reusable file.
+    permissions:
+      contents: read
+      id-token: write
 
   deploy:
     needs: build
     uses: ./.github/workflows/_reusable-deploy.yml
+    permissions:
+      contents: read
+      id-token: write
     with:
       environment: test
       image: ${{ needs.build.outputs.image }}
