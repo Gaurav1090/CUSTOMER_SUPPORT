@@ -34,9 +34,14 @@ module "deployer_service_account" {
   # pushed "customer-support-rag-<env>-deploy" over it (31-32 chars
   # depending on environment). "-cd" keeps every environment's SA name
   # under the limit with room to spare.
-  account_id    = "${var.app_name}-${var.environment}-cd"
-  display_name  = "CI/CD deployer SA (${var.environment})"
-  project_roles = ["roles/run.admin", "roles/iam.serviceAccountUser"]
+  account_id   = "${var.app_name}-${var.environment}-cd"
+  display_name = "CI/CD deployer SA (${var.environment})"
+  # run.admin: deploy/manage the Cloud Run service and job.
+  # iam.serviceAccountUser: attach the runtime SA to them.
+  # artifactregistry.reader: pull the built image at deploy time --
+  # missing this produced a real failure on the first live deploy attempt
+  # ("PERMISSION_DENIED: artifactregistry.repositories.downloadArtifacts").
+  project_roles = ["roles/run.admin", "roles/iam.serviceAccountUser", "roles/artifactregistry.reader"]
 
   enable_wif_binding = true
   wif_pool_name      = var.wif_pool_name
