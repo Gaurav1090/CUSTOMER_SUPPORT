@@ -31,6 +31,12 @@ jobs:
           echo "::error::cloud_provider='${{ inputs.cloud_provider }}' is not implemented yet. Only 'gcp' is wired up (infra/providers/gcp). See infra/modules/${{ inputs.cloud_provider }}/README.md for the extension plan."
           exit 1
 
+      # Required for the local composite action reference below -- without
+      # this, ./.github/actions/gcp-auth doesn't exist in the runner's
+      # workspace yet ("Can't find 'action.yml' ... Did you forget to run
+      # actions/checkout").
+      - uses: actions/checkout@v4
+
       - uses: ./.github/actions/gcp-auth
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
