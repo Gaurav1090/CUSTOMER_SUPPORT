@@ -36,7 +36,7 @@ variable "github_repository" {
 }
 
 variable "github_ref" {
-  description = "Restrict WIF impersonation to a single ref, e.g. refs/heads/develop. Null = allow any ref in the repository (used for the shared builder SA, which every environment's pipeline needs). Set for deployer SAs so a dev-branch token can never be replayed to deploy prod."
+  description = "Restrict WIF impersonation to a single ref, e.g. refs/heads/developer. Null = allow any ref in the repository (used for the shared builder SA, which every environment's pipeline needs). Set for deployer SAs so a dev-branch token can never be replayed to deploy prod."
   type        = string
   default     = null
 }

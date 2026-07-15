@@ -6,9 +6,9 @@ name: CI - Fast Tests
 # manual dispatch instead, so routine pushes/PRs never burn provider quota.
 on:
   push:
-    branches: [develop, staging, main, "feature-*"]
+    branches: [developer, staging, main, "feature-*"]
   pull_request:
-    branches: [develop, staging, main]
+    branches: [developer, staging, main]
 
 jobs:
   fast-tests:

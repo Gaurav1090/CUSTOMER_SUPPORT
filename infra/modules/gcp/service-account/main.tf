@@ -15,7 +15,7 @@ resource "google_project_iam_member" "roles" {
 # WIF binding: lets a GitHub Actions run impersonate this SA without a
 # long-lived key. Scoped either to "any ref in this repo" (github_ref
 # unset -- the builder SA's case) or to exactly one ref (github_ref set --
-# every deployer SA's case, so a develop-branch pipeline run can never
+# every deployer SA's case, so a developer-branch pipeline run can never
 # mint a token usable to deploy prod).
 resource "google_service_account_iam_member" "wif_binding" {
   count = var.enable_wif_binding ? 1 : 0

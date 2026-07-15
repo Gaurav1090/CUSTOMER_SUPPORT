@@ -22,7 +22,7 @@ environments/
   global/         # project-wide singletons: enabled APIs, the (shared,
                   # build-once-promote-everywhere) Artifact Registry repo,
                   # the WIF pool/provider, and the CI builder SA
-  dev/            # deploys from `develop`, calls providers/gcp
+  dev/            # deploys from `developer`, calls providers/gcp
   test/           # deploys from `staging`, calls providers/gcp
   prod/           # deploys from `main`, calls providers/gcp
 ```

@@ -33,7 +33,7 @@ variable "github_repository" {
 }
 
 variable "github_ref" {
-  description = "Branch this environment deploys from, e.g. refs/heads/develop -- scopes the deployer SA's WIF binding so this environment's CI token can never be replayed against another environment."
+  description = "Branch this environment deploys from, e.g. refs/heads/developer -- scopes the deployer SA's WIF binding so this environment's CI token can never be replayed against another environment."
   type        = string
 }
 

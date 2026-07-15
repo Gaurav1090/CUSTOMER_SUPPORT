@@ -1,5 +1,5 @@
 # One shared pool/provider, scoped to the repository only. Per-environment
-# branch restriction (develop/staging/main) is NOT enforced here -- it
+# branch restriction (developer/staging/main) is NOT enforced here -- it
 # belongs on each deployer service account's WIF IAM binding instead (see
 # infra/modules/gcp/service-account), so a compromised dev-environment
 # token can never be replayed to deploy prod. Restricting branch at the

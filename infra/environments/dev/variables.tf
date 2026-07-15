@@ -39,9 +39,9 @@ variable "github_repository" {
 }
 
 variable "github_ref" {
-  description = "Branch this environment deploys from -- scopes this environment's deployer SA WIF binding."
+  description = "Branch this environment deploys from -- scopes this environment's deployer SA WIF binding. The actual branch is named \"developer\", not \"develop\" -- matches what's already on the remote rather than renaming the branch to fit a generic convention."
   type        = string
-  default     = "refs/heads/develop"
+  default     = "refs/heads/developer"
 }
 
 variable "image" {
