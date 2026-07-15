@@ -43,4 +43,13 @@ EXPOSE 8001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+# --proxy-headers: trust X-Forwarded-Proto/X-Forwarded-For from the
+# fronting proxy -- Cloud Run terminates TLS at its load balancer and
+# forwards to this container over plain HTTP. Without this, Starlette's
+# url_for() (used by templates/chat.html for its own static/style.css,
+# not the external CDN links) generates http:// URLs on an https:// page,
+# which browsers block as mixed content -- the app's own styling silently
+# fails to load while unrelated CDN assets still do, making the UI look
+# broken/unstyled. --forwarded-allow-ips='*' because Cloud Run's proxy
+# doesn't come from a fixed, allowlistable IP.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--proxy-headers", "--forwarded-allow-ips=*"]
