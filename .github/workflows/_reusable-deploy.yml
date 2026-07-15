@@ -8,7 +8,7 @@ on:
         type: string
         required: true
       cloud_provider:
-        description: Only "gcp" is implemented today -- see infra/modules/{aws,azure}/README.md.
+        description: 'Only "gcp" is implemented today -- see infra/modules/aws or azure README.md.'
         type: string
         default: gcp
       image:
