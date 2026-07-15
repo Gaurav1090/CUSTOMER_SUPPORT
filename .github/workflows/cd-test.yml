@@ -1,0 +1,20 @@
+name: CD - Test
+
+on:
+  push:
+    branches: [staging]
+
+jobs:
+  tests:
+    uses: ./.github/workflows/_reusable-tests.yml
+
+  build:
+    needs: tests
+    uses: ./.github/workflows/_reusable-build.yml
+
+  deploy:
+    needs: build
+    uses: ./.github/workflows/_reusable-deploy.yml
+    with:
+      environment: test
+      image: ${{ needs.build.outputs.image }}

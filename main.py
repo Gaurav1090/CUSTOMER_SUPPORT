@@ -3,7 +3,6 @@ import os
 import re
 import secrets
 import time
-from collections import defaultdict
 
 import anyio
 import uvicorn
@@ -21,11 +20,26 @@ from langchain_core.prompts import ChatPromptTemplate
 from retriever.retrieval import Retriever
 
 from utils.model_loader import ModelLoader
-from utils.ops import RateLimiter, RequestTrace, ResponseCache, build_langfuse_trace, new_request_id
+from utils.ops import (
+    RateLimiter,
+    RequestTrace,
+    ResponseCache,
+    SessionStore,
+    build_langfuse_trace,
+    finish_langfuse_trace,
+    new_request_id,
+)
 
 from prompt_library.prompt import PROMPT_TEMPLATES
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
+
+INSUFFICIENT_CONTEXT_NO_DOCS = "Insufficient context. Please provide more details about the product or issue."
+INSUFFICIENT_CONTEXT_UNGROUNDED = "Insufficient context. I cannot confidently answer from the retrieved evidence alone."
 
 load_dotenv()
 
@@ -61,8 +75,7 @@ retriever_obj = Retriever()
 model_loader = ModelLoader()
 response_cache = ResponseCache()
 rate_limiter = RateLimiter()
-
-session_histories = defaultdict(list)
+session_store = SessionStore()
 
 
 @app.middleware("http")
@@ -104,11 +117,27 @@ def strip_reasoning_tokens(output: str) -> str:
     return output.strip()
 
 
+_CITATION_BRACKET_RE = re.compile(r"\s*\[source:[^\]]+\]")
+
+
+def _strip_citations(answer: str) -> str:
+    """Drop [source:ID] markers before an answer is replayed back into a
+    future prompt as chat history. Otherwise a weaker model tends to copy a
+    source ID forward from a *previous* turn's answer and cite it against
+    the *current* turn's freshly retrieved (and likely different) context --
+    a fabricated-looking citation that _verify_citations then correctly
+    rejects, producing a false "Insufficient context" on a question the
+    model could otherwise have answered fine from history."""
+    return _CITATION_BRACKET_RE.sub("", answer)
+
+
 def _build_chat_history(session_id: str) -> str:
-    history = session_histories.get(session_id, [])
+    history = session_store.get_recent(session_id, limit=4)
     if not history:
         return "No prior conversation."
-    return "\n".join(f"User: {item['user']}\nAssistant: {item['assistant']}" for item in history[-4:])
+    return "\n".join(
+        f"User: {item['user']}\nAssistant: {_strip_citations(item['assistant'])}" for item in history
+    )
 
 
 def _judge_groundedness(context: str, answer: str) -> bool:
@@ -120,13 +149,39 @@ def _judge_groundedness(context: str, answer: str) -> bool:
 
 
 def _build_context_text(retrieved_documents):
+    # Delimited so the model can distinguish retrieved (untrusted,
+    # user-generated) review text from its own instructions -- see the
+    # product_bot prompt's injection-defense line.
     return "\n\n".join(
-        f"- {doc.page_content} [source:{doc.metadata.get('source_id', 'unknown')}]" for doc in retrieved_documents
+        f'<doc source="{doc.metadata.get("source_id", "unknown")}">{doc.page_content}</doc>'
+        for doc in retrieved_documents
     )
 
 
 def _source_ids(retrieved_documents):
     return [doc.metadata.get("source_id", "unknown") for doc in retrieved_documents]
+
+
+# Matches each individual "source:ID" token rather than a whole [...]
+# bracket, since some models (observed on Llama-3.3-70B-Instruct via the
+# HuggingFace router) bundle several citations supporting one claim into a
+# single bracket -- "[source:A, source:B]" -- instead of the one-per-bracket
+# form the prompt asks for. Anchoring on the bracket pair alone would treat
+# that whole bundled string as one fabricated ID and fail a fully-grounded
+# answer.
+_CITATION_RE = re.compile(r"source:\s*([^\],\s]+)")
+
+
+def _verify_citations(answer: str, retrieved_documents) -> bool:
+    """False only if the answer cites a source_id that wasn't actually
+    retrieved -- a fabricated citation, and a stronger hallucination signal
+    than the LLM groundedness judge alone. An answer with no citations at
+    all isn't flagged here; that's the judge's job."""
+    cited_ids = set(_CITATION_RE.findall(answer))
+    if not cited_ids:
+        return True
+    valid_ids = set(_source_ids(retrieved_documents))
+    return cited_ids.issubset(valid_ids)
 
 
 def _embed_query(query: str):
@@ -146,13 +201,12 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         query_embedding = _embed_query(query)
         cached = response_cache.get_exact(query, session_id)
         if not cached and query_embedding:
-            cached = response_cache.get_semantic(query_embedding, session_id)
+            cached = response_cache.get_semantic(query, query_embedding, session_id)
         if cached:
             trace.add("cache_hit", cached.hit_type)
             trace.finish("ok")
-            if langfuse_trace:
-                langfuse_trace.update(output={"answer": cached.answer, "cache_hit": cached.hit_type})
-            session_histories[session_id].append({"user": query, "assistant": cached.answer})
+            finish_langfuse_trace(langfuse_trace, trace, output=cached.answer)
+            session_store.append(session_id, query, cached.answer)
             return {
                 "answer": cached.answer,
                 "cache_hit": cached.hit_type,
@@ -160,13 +214,15 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
                 "request_id": request_id,
             }
 
+        chat_history = _build_chat_history(session_id)
+
         retrieval_start = time.time()
-        retrieved_documents = retriever_obj.call_retriever(query)
+        retrieved_documents = retriever_obj.call_retriever(query, chat_history=chat_history)
         trace.add("retrieval_latency_ms", int((time.time() - retrieval_start) * 1000))
+        trace.add("standalone_query", retriever_obj.last_standalone_query)
         trace.add("retrieved_source_ids", _source_ids(retrieved_documents))
 
         context_text = _build_context_text(retrieved_documents)
-        chat_history = _build_chat_history(session_id)
         prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATES["product_bot"])
         llm = model_loader.load_llm()
 
@@ -176,23 +232,33 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         trace.add("generation_latency_ms", int((time.time() - generation_start) * 1000))
         output = strip_reasoning_tokens(output)
 
+        citation_check = "skipped_no_context"
+        groundedness_verdict = "skipped_no_context"
         if not retrieved_documents:
-            output = "Insufficient context. Please provide more details about the product or issue."
-        elif not _judge_groundedness(context_text, output):
-            output = "Insufficient context. I cannot confidently answer from the retrieved evidence alone."
+            output = INSUFFICIENT_CONTEXT_NO_DOCS
+        else:
+            citation_check = "passed" if _verify_citations(output, retrieved_documents) else "failed"
+            if citation_check == "failed":
+                output = INSUFFICIENT_CONTEXT_UNGROUNDED
+                groundedness_verdict = "skipped_citation_failed"
+            else:
+                groundedness_verdict = "passed" if _judge_groundedness(context_text, output) else "failed"
+                if groundedness_verdict == "failed":
+                    output = INSUFFICIENT_CONTEXT_UNGROUNDED
+        trace.add("citation_check", citation_check)
+        trace.add("groundedness_verdict", groundedness_verdict)
 
-        response_cache.set(query, session_id, output, query_embedding=query_embedding)
-        session_histories[session_id].append({"user": query, "assistant": output})
+        # Don't cache a refusal -- citation/groundedness failures are often
+        # transient (LLM sampling variance on retry), and caching one would
+        # make it "sticky" for the full TTL: every repeat or paraphrase of
+        # a genuinely answerable question would keep getting refused until
+        # expiry, even though a fresh retry could well succeed.
+        if output not in (INSUFFICIENT_CONTEXT_NO_DOCS, INSUFFICIENT_CONTEXT_UNGROUNDED):
+            response_cache.set(query, session_id, output, query_embedding=query_embedding)
+        session_store.append(session_id, query, output)
         trace.add("cache_hit", "miss")
         trace.finish("ok")
-        if langfuse_trace:
-            langfuse_trace.update(
-                output={"answer": output},
-                metadata={
-                    "retrieved_source_ids": _source_ids(retrieved_documents),
-                    "cache_hit": "miss",
-                },
-            )
+        finish_langfuse_trace(langfuse_trace, trace, output=output)
         return {
             "answer": output,
             "cache_hit": "miss",
@@ -203,6 +269,7 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         raise
     except Exception as exc:
         trace.finish("error", error=str(exc))
+        finish_langfuse_trace(langfuse_trace, trace, error=str(exc))
         logger.exception("Failed to generate response.")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

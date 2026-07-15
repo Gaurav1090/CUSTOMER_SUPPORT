@@ -1,0 +1,30 @@
+name: CD - Prod
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  tests:
+    uses: ./.github/workflows/_reusable-tests.yml
+
+  # Quota-heavy live-provider evaluation only runs here, blocking prod --
+  # everywhere else (dev/test/every PR) only pays for the fast unit suite.
+  evaluation:
+    needs: tests
+    uses: ./.github/workflows/rag-evaluation.yml
+    secrets: inherit
+
+  build:
+    needs: evaluation
+    uses: ./.github/workflows/_reusable-build.yml
+
+  # Configure a GitHub Environment named "prod" with required reviewers in
+  # repo settings to add a manual-approval gate here natively, on top of
+  # the automated evaluation gate above -- no extra workflow logic needed.
+  deploy:
+    needs: build
+    uses: ./.github/workflows/_reusable-deploy.yml
+    with:
+      environment: prod
+      image: ${{ needs.build.outputs.image }}

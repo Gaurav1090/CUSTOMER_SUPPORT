@@ -45,29 +45,91 @@ class CacheResult:
     hit_type: str
 
 
+_nli_model = None
+_nli_model_load_failed = False
+
+
+def _get_nli_model():
+    """Lazily load a single shared CrossEncoder NLI model for the process
+    lifetime (unlike utils/model_loader.py's LLM, this one has no reason to
+    be swappable per-request, so a module-level singleton is correct here --
+    reloading it per call would be the same per-request-instantiation
+    mistake found in build_langfuse_trace())."""
+    global _nli_model, _nli_model_load_failed
+    if _nli_model is not None or _nli_model_load_failed:
+        return _nli_model
+    try:
+        from sentence_transformers import CrossEncoder
+
+        model_name = os.getenv("SEMANTIC_CACHE_NLI_MODEL", "cross-encoder/nli-deberta-v3-small")
+        _nli_model = CrossEncoder(model_name)
+        logger.info("Semantic cache NLI model loaded: %s", model_name)
+    except Exception:
+        logger.exception("Failed to load semantic cache NLI model; semantic cache disabled.")
+        _nli_model_load_failed = True
+    return _nli_model
+
+
+def _is_paraphrase(cached_query: str, incoming_query: str) -> bool:
+    """True only if incoming_query is a reworded restatement of cached_query,
+    not merely topically similar and not a negated/opposite question.
+
+    Cosine similarity on sentence embeddings can't tell these apart -- e.g.
+    on all-MiniLM-L6-v2, "good battery life" vs "poor battery life" scores
+    *higher* (~0.97) than a genuine paraphrase (~0.89), because negation
+    barely shifts embedding space. An NLI cross-encoder is used instead:
+    require entailment forward (cached -> incoming) and no contradiction
+    reverse (incoming -> cached). Both checks are needed -- on the "is it
+    worth buying" / "is it not worth buying" pair, the reverse direction
+    alone gave a weak, ambiguous entailment signal, but the forward
+    direction correctly flagged contradiction.
+    """
+    nli = _get_nli_model()
+    if nli is None:
+        return False
+
+    labels = nli.config.id2label
+    scores = nli.predict([(cached_query, incoming_query), (incoming_query, cached_query)])
+    forward_label = labels[int(scores[0].argmax())]
+    reverse_label = labels[int(scores[1].argmax())]
+    return forward_label == "entailment" and reverse_label != "contradiction"
+
+
+def _build_redis_client(purpose: str):
+    """Connect to REDIS_URL if set, else None (caller falls back to
+    in-memory). Shared by ResponseCache/RateLimiter/SessionStore so the
+    connect-and-log-loudly-on-failure behavior stays identical across all
+    three instead of drifting between copies."""
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        return None
+    try:
+        import redis
+
+        client = redis.Redis.from_url(redis_url, decode_responses=True)
+        client.ping()
+        logger.info("Redis %s connected.", purpose)
+        return client
+    except Exception:
+        logger.exception("Redis %s unavailable; falling back to in-memory %s.", purpose, purpose)
+        return None
+
+
 class ResponseCache:
     def __init__(self):
         self.enabled = os.getenv("CACHE_ENABLED", "true").lower() == "true"
         self.ttl_seconds = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
-        self.semantic_threshold = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.92"))
-        self.redis = self._build_redis_client()
+        # Cheap cosine pre-filter only -- NOT the final hit decision. Cosine
+        # similarity alone can't separate paraphrases from negated opposites
+        # (see _is_paraphrase), so this just narrows candidates worth the
+        # more expensive NLI check. Genuine paraphrases measured ~0.89 on
+        # all-MiniLM-L6-v2 vs ~0.55-0.64 for same-product-different-feature
+        # questions, so 0.80 comfortably keeps the former as candidates
+        # while skipping NLI on the latter.
+        self.semantic_candidate_threshold = float(os.getenv("SEMANTIC_CACHE_CANDIDATE_THRESHOLD", "0.80"))
+        self.redis = _build_redis_client("cache")
         self.memory_exact: Dict[str, Dict[str, Any]] = {}
         self.memory_semantic: List[Dict[str, Any]] = []
-
-    def _build_redis_client(self):
-        redis_url = os.getenv("REDIS_URL")
-        if not redis_url:
-            return None
-        try:
-            import redis
-
-            client = redis.Redis.from_url(redis_url, decode_responses=True)
-            client.ping()
-            logger.info("Redis cache connected.")
-            return client
-        except Exception:
-            logger.exception("Redis cache unavailable; falling back to in-memory cache.")
-            return None
 
     def get_exact(self, query: str, session_id: str) -> Optional[CacheResult]:
         if not self.enabled:
@@ -86,23 +148,28 @@ class ResponseCache:
         self.memory_exact.pop(key, None)
         return None
 
-    def get_semantic(self, query_embedding: List[float], session_id: str) -> Optional[CacheResult]:
+    def get_semantic(self, query: str, query_embedding: List[float], session_id: str) -> Optional[CacheResult]:
         if not self.enabled or not query_embedding:
             return None
 
         entries = self._semantic_entries()
-        best_answer = None
-        best_score = 0.0
+        candidates = []
         for entry in entries:
             if entry.get("session_id") != session_id:
                 continue
             score = cosine_similarity(query_embedding, entry.get("embedding", []))
-            if score > best_score:
-                best_score = score
-                best_answer = entry.get("answer")
+            if score >= self.semantic_candidate_threshold:
+                candidates.append((score, entry))
+        candidates.sort(key=lambda pair: pair[0], reverse=True)
 
-        if best_answer and best_score >= self.semantic_threshold:
-            return CacheResult(answer=best_answer, hit_type="semantic")
+        # Cosine similarity alone can rank a negated opposite above a real
+        # paraphrase (see _is_paraphrase), so every candidate must also pass
+        # the NLI entailment gate -- highest-cosine first, first pass wins.
+        max_candidates = int(os.getenv("SEMANTIC_CACHE_MAX_NLI_CHECKS", "5"))
+        for _, entry in candidates[:max_candidates]:
+            cached_query = entry.get("query", "")
+            if cached_query and _is_paraphrase(cached_query, query):
+                return CacheResult(answer=entry.get("answer"), hit_type="semantic")
         return None
 
     def set(self, query: str, session_id: str, answer: str, query_embedding: Optional[List[float]] = None) -> None:
@@ -120,7 +187,7 @@ class ResponseCache:
         }
 
         if self.redis:
-            self.redis.setex(f"rag:exact:{exact_key}", self.ttl_seconds, exact_payload)
+            self.redis.set(f"rag:exact:{exact_key}", exact_payload, ex=self.ttl_seconds)
             if query_embedding:
                 self.redis.lpush("rag:semantic:index", json.dumps(semantic_payload))
                 self.redis.ltrim("rag:semantic:index", 0, int(os.getenv("SEMANTIC_CACHE_MAX_ENTRIES", "500")) - 1)
@@ -155,23 +222,8 @@ class RateLimiter:
     def __init__(self):
         self.limit = int(os.getenv("RATE_LIMIT_REQUESTS", "30"))
         self.window_seconds = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
-        self.redis = self._build_redis_client()
+        self.redis = _build_redis_client("rate limiter")
         self.memory_hits: Dict[str, deque] = defaultdict(deque)
-
-    def _build_redis_client(self):
-        redis_url = os.getenv("REDIS_URL")
-        if not redis_url:
-            return None
-        try:
-            import redis
-
-            client = redis.Redis.from_url(redis_url, decode_responses=True)
-            client.ping()
-            logger.info("Redis rate limiter connected.")
-            return client
-        except Exception:
-            logger.exception("Redis rate limiter unavailable; falling back to in-memory limits.")
-            return None
 
     def allow(self, identity: str) -> bool:
         if self.limit <= 0:
@@ -192,6 +244,48 @@ class RateLimiter:
             return False
         hits.append(now)
         return True
+
+
+class SessionStore:
+    """Per-session chat history, Redis-backed with in-memory fallback --
+    same connect/degrade pattern as ResponseCache/RateLimiter. Redis-backed
+    so multi-turn history survives a process restart and stays consistent
+    if this ever runs as multiple replicas; the in-memory fallback keeps
+    history local to whichever process/replica handled each request, which
+    silently breaks multi-turn context the moment there's more than one."""
+
+    def __init__(self):
+        self.ttl_seconds = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
+        self.max_turns = int(os.getenv("SESSION_MAX_TURNS", "20"))
+        self.redis = _build_redis_client("session store")
+        self.memory: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+
+    def append(self, session_id: str, user: str, assistant: str) -> None:
+        turn = {"user": user, "assistant": assistant}
+
+        if self.redis:
+            key = f"rag:session:{session_id}"
+            self.redis.rpush(key, json.dumps(turn))
+            self.redis.ltrim(key, -self.max_turns, -1)
+            self.redis.expire(key, self.ttl_seconds)
+            return
+
+        history = self.memory[session_id]
+        history.append(turn)
+        del history[: -self.max_turns]
+
+    def get_recent(self, session_id: str, limit: int = 4) -> List[Dict[str, str]]:
+        if self.redis:
+            raw_entries = self.redis.lrange(f"rag:session:{session_id}", -limit, -1)
+            turns = []
+            for raw_entry in raw_entries:
+                try:
+                    turns.append(json.loads(raw_entry))
+                except json.JSONDecodeError:
+                    continue
+            return turns
+
+        return self.memory.get(session_id, [])[-limit:]
 
 
 @dataclass
@@ -221,17 +315,90 @@ class RequestTrace:
         logger.info(json.dumps(payload, default=str))
 
 
-def build_langfuse_trace(trace: RequestTrace):
-    if not os.getenv("LANGFUSE_PUBLIC_KEY") or not os.getenv("LANGFUSE_SECRET_KEY"):
-        return None
+_langfuse_client = None
+_langfuse_client_init_failed = False
+
+
+def _get_langfuse_client():
+    """Lazily build a single shared Langfuse client for the process
+    lifetime. Constructing Langfuse() sets up its OTel exporter/tracer
+    provider, which measured ~5.9s when done per-request -- trivial next
+    to a normal 8-18s retrieval+generation request, but it was the
+    dominant cost on a cache hit, where everything else is skipped."""
+    global _langfuse_client, _langfuse_client_init_failed
+    if _langfuse_client is not None or _langfuse_client_init_failed:
+        return _langfuse_client
     try:
         from langfuse import Langfuse
 
-        return Langfuse().trace(
-            id=trace.request_id,
+        _langfuse_client = Langfuse()
+    except Exception:
+        logger.exception("Langfuse client initialization failed.")
+        _langfuse_client_init_failed = True
+    return _langfuse_client
+
+
+def build_langfuse_trace(trace: RequestTrace):
+    """Start a Langfuse span for this request, tagged with a trace ID
+    deterministically derived from our own request_id (so a RequestTrace
+    JSON log line and its Langfuse trace can be cross-referenced by that
+    ID). Returns None -- and the caller just skips Langfuse entirely --
+    when the keys aren't set or the SDK call fails for any reason,
+    including an incompatible langfuse-python version: the old `.trace()`
+    call this replaced was removed in the v3+ OpenTelemetry-based SDK
+    rewrite, which made every Langfuse call here silently no-op (caught by
+    this same except, span always None) on any langfuse>=3 install --
+    tracing looked wired up but nothing ever reached the dashboard."""
+    if not os.getenv("LANGFUSE_PUBLIC_KEY") or not os.getenv("LANGFUSE_SECRET_KEY"):
+        return None
+    try:
+        client = _get_langfuse_client()
+        if client is None:
+            return None
+        trace_id = client.create_trace_id(seed=trace.request_id)
+        return client.start_observation(
+            trace_context={"trace_id": trace_id},
             name="rag-chat",
+            as_type="span",
             input={"question": trace.question, "session_id": trace.session_id},
+            metadata={"session_id": trace.session_id},
         )
     except Exception:
         logger.exception("Langfuse trace initialization failed.")
         return None
+
+
+def finish_langfuse_trace(
+    span, trace: RequestTrace, output: Optional[str] = None, error: Optional[str] = None
+) -> None:
+    """Attach the final answer, the full RequestTrace event payload, and
+    the citation/groundedness verdicts as first-class Langfuse scores (so
+    they show up as chartable trend lines in the Langfuse dashboard --
+    e.g. "citation_check pass rate over the last 7 days" -- instead of
+    being buried, unqueryable, inside metadata JSON) before ending the
+    span. A no-op if span is None (Langfuse disabled/unavailable), and
+    never lets an observability failure break the actual response."""
+    if span is None:
+        return
+    try:
+        span.update(
+            output={"answer": output} if output is not None else None,
+            metadata=dict(trace.events),
+            level="ERROR" if error else "DEFAULT",
+            status_message=error,
+        )
+        if trace.events.get("citation_check") in ("passed", "failed"):
+            span.score(
+                name="citation_check",
+                value=1.0 if trace.events["citation_check"] == "passed" else 0.0,
+                data_type="BOOLEAN",
+            )
+        if trace.events.get("groundedness_verdict") in ("passed", "failed"):
+            span.score(
+                name="groundedness",
+                value=1.0 if trace.events["groundedness_verdict"] == "passed" else 0.0,
+                data_type="BOOLEAN",
+            )
+        span.end()
+    except Exception:
+        logger.exception("Failed to finalize Langfuse trace.")

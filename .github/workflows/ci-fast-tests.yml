@@ -1,0 +1,15 @@
+name: CI - Fast Tests
+
+# Always-on, quota-free gate -- the 82-test unit suite only, no live
+# Groq/Chroma/Cohere calls. The quota-heavy evaluation (rag-evaluation.yml)
+# is deliberately NOT run here; it's gated to the prod deploy path and
+# manual dispatch instead, so routine pushes/PRs never burn provider quota.
+on:
+  push:
+    branches: [developer, staging, main, "feature-*"]
+  pull_request:
+    branches: [developer, staging, main]
+
+jobs:
+  fast-tests:
+    uses: ./.github/workflows/_reusable-tests.yml

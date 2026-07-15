@@ -1,0 +1,45 @@
+name: RAG Evaluation
+
+# Quota-heavy: makes real Groq/Chroma/Cohere calls via
+# evaluation/run_evaluation.py. Deliberately NOT triggered on every
+# push/PR (that used to burn Groq quota on routine commits) -- only before
+# a prod deploy (called from cd-prod.yml) or on manual demand.
+on:
+  workflow_dispatch: {}
+  workflow_call: {}
+
+jobs:
+  evaluation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install redis fakeredis
+
+      - name: Run golden-set evaluation
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          CHROMA_API_KEY: ${{ secrets.CHROMA_API_KEY }}
+          CHROMA_TENANT: ${{ secrets.CHROMA_TENANT }}
+          CHROMA_DATABASE: ${{ secrets.CHROMA_DATABASE }}
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+        run: |
+          # Fails the build (non-zero exit) if mean_score regresses beyond
+          # tolerance against evaluation/baseline_results.json.
+          python -m evaluation.run_evaluation
+
+      - name: Upload evaluation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-results
+          path: evaluation/results.json

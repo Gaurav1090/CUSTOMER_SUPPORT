@@ -1,0 +1,70 @@
+name: _reusable-deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: dev | test | prod -- must match a GitHub Environment name configured in repo settings, whose secrets/vars this job picks up.
+        type: string
+        required: true
+      cloud_provider:
+        description: Only "gcp" is implemented today -- see infra/modules/{aws,azure}/README.md.
+        type: string
+        default: gcp
+      image:
+        description: Full image reference from _reusable-build.yml's output.
+        type: string
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Guard unimplemented cloud providers
+        if: inputs.cloud_provider != 'gcp'
+        run: |
+          echo "::error::cloud_provider='${{ inputs.cloud_provider }}' is not implemented yet. Only 'gcp' is wired up (infra/providers/gcp). See infra/modules/${{ inputs.cloud_provider }}/README.md for the extension plan."
+          exit 1
+
+      - uses: ./.github/actions/gcp-auth
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA_EMAIL }}
+
+      - name: Run ingestion job
+        run: |
+          set -euo pipefail
+          gcloud run jobs deploy "${{ vars.CLOUD_RUN_JOB_NAME }}" \
+            --image="${{ inputs.image }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --project="${{ vars.GCP_PROJECT_ID }}"
+          gcloud run jobs execute "${{ vars.CLOUD_RUN_JOB_NAME }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --wait
+
+      - name: Deploy app service
+        run: |
+          set -euo pipefail
+          gcloud run deploy "${{ vars.CLOUD_RUN_SERVICE_NAME }}" \
+            --image="${{ inputs.image }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --project="${{ vars.GCP_PROJECT_ID }}"
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          URL=$(gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE_NAME }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --format="value(status.url)")
+          echo "Deployed: $URL"
+          curl -sf "$URL/health"
+          echo ""
+          curl -sf "$URL/ready"
+          echo ""

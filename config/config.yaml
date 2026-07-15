@@ -1,4 +1,7 @@
 chroma:
+  # Back to the original collection -- matches the local HuggingFace
+  # embedding space below, and it's already fully populated (450 rows /
+  # 542 chunks) from before the Google detour, so no re-ingestion needed.
   collection_name: "ecommercedata"
 
 embedding_model:
@@ -8,14 +11,55 @@ embedding_model:
 ingestion:
   chunk_size: 400
   chunk_overlap: 80
-  state_file: "data/.ingestion_state.json"
-  keyword_index_file: "data/.keyword_index.json"
+  # Where source documents land before ingestion. Local dev: a plain folder.
+  # Prod: swap for "gs://bucket/landing", "s3://bucket/landing", or
+  # "abfs://container/landing" -- no code change needed, only this value
+  # (or the LANDING_PATH env var, which takes precedence).
+  landing_path: "data/landing"
+  # Ingestion state (processed file/chunk manifest) and the BM25 keyword
+  # index both live under this prefix, in the same storage backend as the
+  # landing path, so a fresh ingestion job container has no local state to
+  # lose.
+  index_path: "data/landing/_index"
+  supported_extensions: [".pdf", ".csv"]
+  # Legacy CSV path, kept for the bundled demo dataset / tests only.
+  legacy_csv_path: "data/flipkart_product_review.csv"
 
 retriever:
+  # Dense/BM25 candidate pool fetched before merge+rerank when there is no
+  # semantic reranker to sort them out (COHERE_API_KEY unset). Deliberately
+  # narrow -- the lexical term-overlap fallback reranker is crude, and a
+  # wider pool just gives it more chances to rank an irrelevant-but-
+  # lexically-similar document above the genuinely relevant one.
   top_k: 10
+  # Wider candidate pool used only when Cohere Rerank is actually active --
+  # a real semantic reranker benefits from more candidates to choose from,
+  # unlike the lexical fallback above.
+  rerank_candidate_top_k: 20
   hybrid: true
+  # Final number of documents kept after reranking, passed to generation.
   rerank_top_k: 5
+  # Cohere Rerank model used when COHERE_API_KEY is configured. Falls back
+  # to lexical term-overlap reranking (utils in retriever/retrieval.py) when
+  # unset -- logged loudly, never silent.
+  rerank_model: "rerank-english-v3.0"
+  # Optional minimum Cohere relevance score (0-1) a candidate must clear to
+  # be kept. Unset (null) = no floor, keep top rerank_top_k regardless of
+  # score.
+  rerank_relevance_floor: null
 
 llm:
+  # Provider/model_name are fully swappable -- see utils/model_loader.py
+  # for the groq/google/huggingface branches. Currently on Groq (fastest,
+  # most validated so far); revisit once quota/billing across providers is
+  # sorted out.
+  #
+  # Hit a rate limit / daily quota and need to switch providers right now
+  # without editing this file? Set env vars instead -- they take precedence
+  # over every value below: LLM_PROVIDER (groq|google|huggingface),
+  # LLM_MODEL_NAME, LLM_REWRITE_MODEL_NAME. See .env.example.
   provider: "groq"
   model_name: "llama-3.3-70b-versatile"
+  # Small/fast model used only for conversational query rewriting -- not
+  # the final answer, so it doesn't need the larger model's quality.
+  rewrite_model_name: "llama-3.1-8b-instant"

@@ -1,109 +1,272 @@
 import hashlib
+import io
 import json
+import logging
 import os
 import re
-from typing import Any, List, Optional
+from typing import Any, Dict, List
 
 import pandas as pd
 from dotenv import load_dotenv
 from langchain_core.documents import Document
+from pypdf import PdfReader
 
+from utils.bm25_index import upsert_index
 from utils.chroma_utils import create_chroma_store
 from utils.config_loader import load_config
 from utils.model_loader import ModelLoader
+from utils.object_store import ensure_dir, file_fingerprint, list_files, read_bytes, read_json, write_json
+
+logger = logging.getLogger(__name__)
+
+_WHITESPACE_RE = re.compile(r"[ \t\u00a0]+")
+_BLANK_LINES_RE = re.compile(r"\n{3,}")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def clean_text(text: str) -> str:
+    """Normalize extracted PDF text: strip control chars, collapse repeated
+    whitespace/blank lines. Deliberately simple -- swap in a heavier cleaner
+    (e.g. unstructured's cleaners) later if OCR noise becomes an issue."""
+    if not text:
+        return ""
+    text = _CONTROL_CHARS_RE.sub("", text)
+    text = _WHITESPACE_RE.sub(" ", text)
+    text = _BLANK_LINES_RE.sub("\n\n", text)
+    return text.strip()
 
 
 class DataIngestion:
-    """Handle transformation and ingestion of review data into a Chroma-based vector store."""
+    """Incremental ingestion job: landing storage (GCS/S3/ADLS/local) -> clean
+    -> dedupe -> chunk -> upsert to the vector store -> update BM25 index.
+
+    Designed to run as a stateless, repeatable job (e.g. a Cloud Run Job on a
+    schedule or a GCS event trigger): all state (processed-file manifest,
+    processed-chunk ids, BM25 index) is read from and written back to the
+    same object storage as the source documents, not local disk. Running it
+    twice on the same files is a no-op.
+    """
 
     def __init__(self):
-        print("Initializing DataIngestion pipeline...")
         self.config = load_config()
         self.model_loader = ModelLoader()
         self._load_env_variables()
-        self.csv_path = self._get_csv_path()
-        self.product_data = self._load_csv()
-        self.state_file = os.path.join(os.getcwd(), self.config.get("ingestion", {}).get("state_file", "data/.ingestion_state.json"))
-        self.keyword_index_path = os.path.join(os.getcwd(), self.config.get("ingestion", {}).get("keyword_index_file", "data/.keyword_index.json"))
-        self._ensure_state_files()
+
+        ingestion_cfg = self.config.get("ingestion", {})
+        self.landing_path = os.getenv("LANDING_PATH", ingestion_cfg.get("landing_path", "data/landing"))
+        self.index_path = os.getenv("INDEX_PATH", ingestion_cfg.get("index_path", "data/landing/_index"))
+        self.supported_extensions = tuple(ingestion_cfg.get("supported_extensions", [".pdf"]))
+        self.chunk_size = int(ingestion_cfg.get("chunk_size", 400))
+        self.chunk_overlap = int(ingestion_cfg.get("chunk_overlap", 80))
+
+        self.state_uri = f"{self.index_path.rstrip('/')}/ingestion_state.json"
+        self.bm25_index_uri = f"{self.index_path.rstrip('/')}/bm25_index.json"
+
+        ensure_dir(self.landing_path)
+        logger.info("Ingestion landing path: %s", self.landing_path)
 
     def _load_env_variables(self):
-        """Load optional environment variables used by the ingestion pipeline."""
         load_dotenv()
-
         required_vars = []
         if self.config["embedding_model"]["provider"] == "google":
             required_vars.append("GOOGLE_API_KEY")
-
         missing_vars = [var for var in required_vars if os.getenv(var) is None]
         if missing_vars:
             raise EnvironmentError(f"Missing environment variables: {missing_vars}")
 
-        self.google_api_key = os.getenv("GOOGLE_API_KEY")
         self.chroma_api_key = os.getenv("CHROMA_API_KEY")
         self.chroma_tenant = os.getenv("CHROMA_TENANT")
         self.chroma_database = os.getenv("CHROMA_DATABASE")
 
-    def _get_csv_path(self):
-        """Get path to the CSV file located inside the data folder."""
-        current_dir = os.getcwd()
-        csv_path = os.path.join(current_dir, "data", "flipkart_product_review.csv")
+    # ---------------------------------------------------------------- state
 
+    def _load_state(self) -> Dict[str, Any]:
+        return read_json(self.state_uri, default={"processed_files": {}, "processed_chunk_ids": []})
+
+    def _save_state(self, state: Dict[str, Any]) -> None:
+        write_json(self.state_uri, state)
+
+    # ------------------------------------------------------------- loading
+
+    def _discover_new_files(self, state: Dict[str, Any]) -> List[str]:
+        """List files under the landing path whose fingerprint (size/mtime)
+        has changed since the last run -- this is the incremental step at
+        the file level, before we even open anything."""
+        all_files = list_files(self.landing_path, suffixes=self.supported_extensions)
+        processed = state.get("processed_files", {})
+        new_or_changed = [uri for uri in all_files if processed.get(uri) != file_fingerprint(uri)]
+        logger.info("Landing path has %d files, %d new/changed.", len(all_files), len(new_or_changed))
+        return new_or_changed
+
+    def _dispatch_loader(self, uri: str) -> List[Document]:
+        """Route a landing file to the right loader by extension. Add a new
+        branch here (plus the matching suffix in config.yaml's
+        supported_extensions) whenever a new format needs support."""
+        lower_uri = uri.lower()
+        if lower_uri.endswith(".pdf"):
+            return self._load_pdf_documents(uri)
+        if lower_uri.endswith(".csv"):
+            return self._load_csv_documents(uri)
+        logger.warning("No loader registered for %s; skipping.", uri)
+        return []
+
+    def _load_pdf_documents(self, uri: str) -> List[Document]:
+        """Extract per-page text from a PDF in the landing storage. Returns
+        one Document per non-empty page; downstream chunking splits further."""
+        raw_bytes = read_bytes(uri)
+        documents: List[Document] = []
+        try:
+            reader = PdfReader(io.BytesIO(raw_bytes))
+        except Exception:
+            logger.exception("Failed to open PDF %s; skipping.", uri)
+            return []
+
+        source_file = uri.rsplit("/", 1)[-1]
+        for page_number, page in enumerate(reader.pages, start=1):
+            try:
+                text = clean_text(page.extract_text() or "")
+            except Exception:
+                logger.exception("Failed to extract text from %s page %d; skipping page.", uri, page_number)
+                continue
+            if not text:
+                continue
+            documents.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        "source_file": source_file,
+                        "source_uri": uri,
+                        "page_number": page_number,
+                        # TODO(multimodal): when we start extracting images/tables
+                        # from pages, tag those chunks with modality="image" /
+                        # "table" and route them to a separate embedding model
+                        # instead of overloading this text-only field.
+                        "modality": "text",
+                    },
+                )
+            )
+        return documents
+
+    _REVIEW_COLUMNS = {"product_title", "rating", "summary", "review"}
+
+    def _documents_from_dataframe(self, df: "pd.DataFrame", source_file: str, source_uri: str) -> List[Document]:
+        """Turn a CSV's rows into Documents. Recognizes the review-style
+        schema (product_title/rating/summary/review) used by the bundled
+        demo dataset and gives it structured metadata for the rating/price
+        filters in retriever/retrieval.py. Any other CSV shape falls back to
+        a generic "flatten every column into text" row, so an arbitrary CSV
+        dropped in the landing folder still ingests instead of erroring out."""
+        documents: List[Document] = []
+        is_review_style = self._REVIEW_COLUMNS.issubset(set(df.columns))
+
+        for index, row in df.iterrows():
+            source_id = f"{source_file}:row-{index + 1}"
+            if is_review_style:
+                metadata: Dict[str, Any] = {
+                    "product_name": row.get("product_title"),
+                    "product_rating": row.get("rating"),
+                    "product_summary": row.get("summary"),
+                    "source_row": int(index + 1),
+                    "source_file": source_file,
+                    "source_uri": source_uri,
+                    "source_id": source_id,
+                    "modality": "text",
+                }
+                for optional_field in ("price", "category", "brand"):
+                    metadata[optional_field] = row.get(optional_field) if optional_field in row.index else None
+                page_content = clean_text(str(row.get("review", "")))
+            else:
+                metadata = {
+                    "source_row": int(index + 1),
+                    "source_file": source_file,
+                    "source_uri": source_uri,
+                    "source_id": source_id,
+                    "modality": "text",
+                }
+                page_content = clean_text(", ".join(f"{col}: {row[col]}" for col in df.columns))
+
+            if page_content:
+                documents.append(Document(page_content=page_content, metadata=metadata))
+        return documents
+
+    def _load_csv_documents(self, uri: str) -> List[Document]:
+        """Any CSV dropped in the landing folder -- not just the bundled
+        demo file. Same object-store read path as PDFs, so this works
+        identically whether landing_path is local or gs://\\s3://\\abfs://."""
+        try:
+            raw_bytes = read_bytes(uri)
+            df = pd.read_csv(io.BytesIO(raw_bytes))
+        except Exception:
+            logger.exception("Failed to read CSV %s; skipping.", uri)
+            return []
+        source_file = uri.rsplit("/", 1)[-1]
+        return self._documents_from_dataframe(df, source_file, uri)
+
+    def _load_legacy_csv_documents(self) -> List[Document]:
+        """The original Flipkart review CSV at a fixed path, kept only for
+        the bundled demo / tests -- gated by INGEST_LEGACY_CSV, separate
+        from the landing folder scan. Prefer dropping CSVs into
+        landing_path instead; that path is picked up automatically and
+        tracked incrementally like everything else."""
+        csv_path = self.config.get("ingestion", {}).get("legacy_csv_path", "data/flipkart_product_review.csv")
         if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"CSV file not found at: {csv_path}")
-
-        return csv_path
-
-    def _load_csv(self):
-        """Load product data from CSV."""
-        df = pd.read_csv(self.csv_path)
+            return []
+        df = pd.read_csv(csv_path)
         expected_columns = {"product_title", "rating", "summary", "review"}
-
         if not expected_columns.issubset(set(df.columns)):
             raise ValueError(f"CSV must contain columns: {expected_columns}")
+        return self._documents_from_dataframe(df, os.path.basename(csv_path), csv_path)
 
-        return df
+    # ------------------------------------------------------------ chunking
 
-    def _ensure_state_files(self):
-        os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
-        os.makedirs(os.path.dirname(self.keyword_index_path), exist_ok=True)
-        if not os.path.exists(self.state_file):
-            with open(self.state_file, "w", encoding="utf-8") as handle:
-                json.dump({"processed_ids": []}, handle)
-        if not os.path.exists(self.keyword_index_path):
-            with open(self.keyword_index_path, "w", encoding="utf-8") as handle:
-                json.dump({}, handle)
-
-    def _load_processed_ids(self) -> set[str]:
+    def _create_splitter(self):
         try:
-            with open(self.state_file, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-            return set(data.get("processed_ids", []))
-        except (FileNotFoundError, json.JSONDecodeError):
-            return set()
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
+        except ImportError:
+            return None
+        return RecursiveCharacterTextSplitter(chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
 
-    def _save_processed_ids(self, ids: List[str]) -> None:
-        existing_ids = self._load_processed_ids()
-        existing_ids.update(ids)
-        with open(self.state_file, "w", encoding="utf-8") as handle:
-            json.dump({"processed_ids": sorted(existing_ids)}, handle)
+    def chunk_documents(self, documents: List[Document]) -> List[Document]:
+        splitter = self._create_splitter()
+        chunked_documents: List[Document] = []
 
-    def _tokenize(self, text: str) -> List[str]:
-        return re.findall(r"[a-z0-9]+", text.lower())
+        for document in documents:
+            parent_metadata = dict(document.metadata or {})
+            if splitter is not None:
+                split_docs = splitter.split_documents([document])
+            else:
+                text = document.page_content or ""
+                split_docs = []
+                if text.strip():
+                    start = 0
+                    while start < len(text):
+                        end = min(len(text), start + self.chunk_size)
+                        chunk_text = text[start:end].strip()
+                        if not chunk_text:
+                            break
+                        split_docs.append(Document(page_content=chunk_text, metadata=dict(parent_metadata)))
+                        if end >= len(text):
+                            break
+                        start = max(0, end - self.chunk_overlap)
 
-    def _write_keyword_index(self, documents: List[Document]) -> None:
-        index: dict[str, dict[str, Any]] = {}
-        for doc in documents:
-            doc_id = self.build_document_id(doc)
-            tokens = self._tokenize(doc.page_content or "")
-            index[doc_id] = {
-                "text": doc.page_content,
-                "metadata": doc.metadata,
-                "tokens": {token: tokens.count(token) for token in set(tokens)},
-            }
+            if not split_docs:
+                continue
+            for index, chunk in enumerate(split_docs):
+                metadata = dict(parent_metadata)
+                metadata.update(
+                    {
+                        "chunk_index": index,
+                        "chunk_count": len(split_docs),
+                        "source_id": parent_metadata.get("source_id")
+                        or f"{parent_metadata.get('source_file', 'document')}:p{parent_metadata.get('page_number', 0)}",
+                    }
+                )
+                chunk.metadata = metadata
+                chunked_documents.append(chunk)
 
-        with open(self.keyword_index_path, "w", encoding="utf-8") as handle:
-            json.dump(index, handle, indent=2)
+        return chunked_documents
+
+    # -------------------------------------------------------------- dedupe
 
     def build_document_id(self, document: Document) -> str:
         metadata = document.metadata or {}
@@ -116,88 +279,14 @@ class DataIngestion:
         source_id = metadata.get("source_id") or "document"
         return f"{source_id}:{digest[:12]}"
 
-    def _create_splitter(self):
-        try:
-            from langchain_text_splitters import RecursiveCharacterTextSplitter
-        except ImportError:
-            return None
+    # ------------------------------------------------------------- upsert
 
-        chunk_size = int(self.config.get("ingestion", {}).get("chunk_size", 400))
-        chunk_overlap = int(self.config.get("ingestion", {}).get("chunk_overlap", 80))
-        return RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-
-    def chunk_documents(self, documents: List[Document]) -> List[Document]:
-        splitter = self._create_splitter()
-        chunked_documents: List[Document] = []
-        chunk_size = int(self.config.get("ingestion", {}).get("chunk_size", 400))
-        chunk_overlap = int(self.config.get("ingestion", {}).get("chunk_overlap", 80))
-
-        for document in documents:
-            parent_metadata = dict(document.metadata or {})
-            if splitter is not None:
-                split_docs = splitter.split_documents([document])
-            else:
-                text = document.page_content or ""
-                split_docs = []
-                if text.strip():
-                    start = 0
-                    while start < len(text):
-                        end = min(len(text), start + chunk_size)
-                        chunk_text = text[start:end].strip()
-                        if not chunk_text:
-                            break
-                        split_docs.append(Document(page_content=chunk_text, metadata=dict(parent_metadata)))
-                        if end >= len(text):
-                            break
-                        start = max(0, end - chunk_overlap)
-
-            if not split_docs:
-                continue
-            for index, chunk in enumerate(split_docs):
-                metadata = dict(parent_metadata)
-                metadata.update(
-                    {
-                        "chunk_index": index,
-                        "chunk_count": len(split_docs),
-                        "source_id": parent_metadata.get("source_id") or self.build_document_id(document),
-                    }
-                )
-                chunk.metadata = metadata
-                chunked_documents.append(chunk)
-
-        return chunked_documents
-
-    def transform_data(self):
-        """Transform product data into chunked LangChain Document objects with structured metadata."""
-        documents: List[Document] = []
-
-        for index, row in self.product_data.iterrows():
-            metadata: dict[str, Any] = {
-                "product_name": row.get("product_title") if "product_title" in row.index else None,
-                "product_rating": row.get("rating") if "rating" in row.index else None,
-                "product_summary": row.get("summary") if "summary" in row.index else None,
-                "source_row": int(index + 1),
-                "source_file": os.path.basename(self.csv_path),
-                "source_id": f"row-{index + 1}",
-            }
-
-            for optional_field in ("price", "category", "brand"):
-                if optional_field in row.index:
-                    metadata[optional_field] = row.get(optional_field)
-                else:
-                    metadata[optional_field] = None
-
-            doc = Document(page_content=str(row.get("review", "")), metadata=metadata)
-            documents.append(doc)
-
-        chunked_documents = self.chunk_documents(documents)
-        print(f"Transformed {len(chunked_documents)} chunked documents.")
-        return chunked_documents
-
-    def store_in_vector_db(self, documents: List[Document]):
-        """Store documents into Chroma vector store using upserts and incremental state."""
-        persist_directory = os.path.join(os.getcwd(), "chroma_db")
-        processed_ids = self._load_processed_ids()
+    def store_in_vector_db(self, documents: List[Document], state: Dict[str, Any]):
+        """Upsert only genuinely new chunks (content-hash dedupe) into the
+        vector store, then update the BM25 index to match. Cloud Chroma is
+        required here and enforced by create_chroma_store -- see
+        utils/chroma_utils.py for why there is no local fallback anymore."""
+        processed_ids = set(state.get("processed_chunk_ids", []))
         new_documents: List[Document] = []
         new_ids: List[str] = []
 
@@ -209,8 +298,8 @@ class DataIngestion:
             new_ids.append(doc_id)
 
         if not new_documents:
-            print("No new documents to ingest; existing state already covers the current corpus.")
-            return None, []
+            logger.info("No new chunks to ingest.")
+            return []
 
         vstore = create_chroma_store(
             collection_name=self.config["chroma"]["collection_name"],
@@ -218,46 +307,65 @@ class DataIngestion:
             chroma_api_key=self.chroma_api_key,
             chroma_tenant=self.chroma_tenant,
             chroma_database=self.chroma_database,
-            persist_directory=persist_directory,
             storage_mode=os.getenv("CHROMA_STORAGE_MODE", "auto"),
         )
-        try:
-            inserted_ids = vstore.add_documents(new_documents, ids=new_ids)
-        except Exception as exc:
-            if "quota" not in str(exc).lower() and "rate limit" not in str(exc).lower():
-                raise
-            print("Cloud Chroma quota exceeded; retrying with local persistence.")
-            vstore = create_chroma_store(
-                collection_name=self.config["chroma"]["collection_name"],
-                embedding_function=self.model_loader.load_embeddings(),
-                chroma_api_key=None,
-                chroma_tenant=None,
-                chroma_database=None,
-                persist_directory=persist_directory,
-                storage_mode="local",
-            )
-            inserted_ids = vstore.add_documents(new_documents, ids=new_ids)
 
-        self._save_processed_ids(new_ids)
-        self._write_keyword_index(new_documents)
-        print(f"Successfully inserted {len(inserted_ids)} new chunked documents into Chroma.")
-        return vstore, inserted_ids
+        # Chroma Cloud caps a single write at 300 records (see
+        # https://docs.trychroma.com/cloud/quotas-limits). Default to a
+        # margin below that in case a future record is larger than usual;
+        # override with CHROMA_UPSERT_BATCH_SIZE if you're on a plan with a
+        # different limit.
+        batch_size = int(os.getenv("CHROMA_UPSERT_BATCH_SIZE", "250"))
+        inserted_ids: List[str] = []
+        total = len(new_documents)
+        for start in range(0, total, batch_size):
+            batch_docs = new_documents[start : start + batch_size]
+            batch_ids = new_ids[start : start + batch_size]
 
-    def run_pipeline(self):
-        """Run the full data ingestion pipeline: transform data and store into the vector DB."""
-        documents = self.transform_data()
-        vstore, inserted_ids = self.store_in_vector_db(documents)
-        if not vstore:
+            batch_inserted = vstore.add_documents(batch_docs, ids=batch_ids)
+            inserted_ids.extend(batch_inserted)
+
+            # Persist progress after every batch, not just at the end -- if
+            # a later batch hits a transient error (quota, timeout), the
+            # chunks already committed here are recorded as processed, so a
+            # re-run only retries what's actually left instead of redoing
+            # (and double-billing) the whole file.
+            upsert_index(self.bm25_index_uri, batch_ids, batch_docs)
+            processed_ids.update(batch_ids)
+            state["processed_chunk_ids"] = sorted(processed_ids)
+            self._save_state(state)
+            logger.info("Upserted batch: %d/%d chunks committed so far.", start + len(batch_ids), total)
+
+        logger.info("Inserted %d new chunks into the vector store and BM25 index.", len(inserted_ids))
+        return inserted_ids
+
+    # ------------------------------------------------------------- driver
+
+    def run_pipeline(self, include_legacy_csv: bool = False):
+        state = self._load_state()
+
+        new_files = self._discover_new_files(state)
+        documents: List[Document] = []
+        for uri in new_files:
+            documents.extend(self._dispatch_loader(uri))
+
+        if include_legacy_csv:
+            documents.extend(self._load_legacy_csv_documents())
+
+        if not documents and not new_files:
+            logger.info("Nothing new to ingest.")
             return
 
-        query = "Can you tell me the low budget headphone?"
-        results = vstore.similarity_search(query)
+        chunked_documents = self.chunk_documents(documents)
+        logger.info("Chunked into %d passages.", len(chunked_documents))
+        self.store_in_vector_db(chunked_documents, state)
 
-        print(f"\nSample search results for query: '{query}'")
-        for res in results:
-            print(f"Content: {res.page_content}\nMetadata: {res.metadata}\n")
+        for uri in new_files:
+            state.setdefault("processed_files", {})[uri] = file_fingerprint(uri)
+        self._save_state(state)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     ingestion = DataIngestion()
-    ingestion.run_pipeline()
+    ingestion.run_pipeline(include_legacy_csv=os.getenv("INGEST_LEGACY_CSV", "false").lower() == "true")

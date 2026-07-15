@@ -1,0 +1,34 @@
+name: _reusable-build
+
+on:
+  workflow_call:
+    outputs:
+      image:
+        description: Full pushed image reference.
+        value: ${{ jobs.build.outputs.image }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/gcp-auth
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_BUILDER_SA_EMAIL }}
+
+      - id: build
+        uses: ./.github/actions/gcp-build-push
+        with:
+          region: ${{ vars.GCP_REGION }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          repository_id: ${{ vars.GCP_ARTIFACT_REPOSITORY_ID }}
+          tag: ${{ github.sha }}

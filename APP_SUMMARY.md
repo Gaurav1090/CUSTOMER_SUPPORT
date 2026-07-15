@@ -1,535 +1,459 @@
-# 🚀 Complete Production-Grade RAG System - Final Summary
+# Customer Support RAG System — Technical Summary
 
-## System Status: ✅ PRODUCTION READY
+Single source of truth for this codebase: what it is, how a request flows through it end to end, every API surface, every config knob, and the reasoning behind the non-obvious decisions. Written to let someone with zero prior context become productive without re-deriving anything from the source.
 
-**Date**: July 9, 2026  
-**Version**: Phase 4 Complete  
-**Status**: All 5 phases implemented, tested, and verified
+Last updated: 2026-07-14, reflecting the state after a full day of live testing, bug fixes, and a latency hardening pass (see [Recent Hardening](#recent-hardening-2026-07-14) at the bottom).
 
 ---
 
-## 📊 What We Built
+## 1. What this is
 
-A production-grade **Customer Support RAG System** that transforms a Flipkart product review dataset into an intelligent chatbot with:
-- **450** product reviews → **542** chunked documents
-- **Hybrid retrieval** (dense vectors + BM25 keyword search)
-- **Grounded generation** with citations and faithfulness checks
-- **Multi-turn conversations** with session memory
-- **Enterprise-grade security** (API key auth, CORS protection)
-- **Comprehensive evaluation** framework with RAGAS-style metrics
+A FastAPI-based e-commerce product-support chatbot. It answers questions about products using **retrieval-augmented generation (RAG)** over a corpus of product reviews (currently: 450 Flipkart reviews, ~542 chunks). It is not a general chatbot — it refuses to answer anything it cannot ground in retrieved evidence, on purpose.
 
----
+Core design commitments, all visible directly in the code:
 
-## 🏗️ Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    User Interface                        │
-│  • Web Chat (http://localhost:8001)                      │
-│  • API (POST /get with X-API-Key header)                 │
-│  • Interactive Docs (http://localhost:8001/docs)         │
-└──────────────────┬──────────────────────────────────────┘
-                   │
-┌──────────────────▼──────────────────────────────────────┐
-│              FastAPI Application                         │
-│  • CORS Middleware (explicit origins)                    │
-│  • API Key Authentication (X-API-Key header)             │
-│  • Session Management (X-Session-Id header)              │
-│  • Error Handling (502 fallback responses)               │
-└──────────────────┬──────────────────────────────────────┘
-                   │
-┌──────────────────▼──────────────────────────────────────┐
-│         Data Retrieval Pipeline                          │
-│  1. Query Rewriting (synonym expansion)                  │
-│  2. Metadata Filter Parsing (rating >= 4, etc.)          │
-│  3. Parallel Dense + Keyword Search                      │
-│  4. RRF Merging (Reciprocal Rank Fusion)                 │
-│  5. Reranking (token overlap + metadata bonus)           │
-│  6. Dynamic Top-K (3-5 documents)                        │
-└──────────────────┬──────────────────────────────────────┘
-                   │
-          ┌────────┴────────┐
-          │                 │
-    ┌─────▼─────┐    ┌─────▼──────┐
-    │Dense Index│    │Keyword Index│
-    │(Chroma)   │    │(BM25)       │
-    └─────┬─────┘    └─────┬──────┘
-          │                 │
-    ┌─────▼───────────────┬─┴────────┐
-    │ HuggingFace         │          │
-    │ Embeddings          │ Token    │
-    │ (384-dim)           │ Index    │
-    │ 542 documents       │ (JSON)   │
-    └─────────────────────┴──────────┘
-                   │
-┌──────────────────▼──────────────────────────────────────┐
-│       Generation & Grounding                             │
-│  1. Build Context (top-5 + metadata)                     │
-│  2. Load Chat History (last 4 turns)                     │
-│  3. Call Groq LLM (deepseek/mixtral)                     │
-│  4. Strip Reasoning Tokens (<think>...)                  │
-│  5. Faithfulness Check (LLM judge)                       │
-│  6. Fallback Path (insufficient context)                 │
-└──────────────────┬──────────────────────────────────────┘
-                   │
-┌──────────────────▼──────────────────────────────────────┐
-│                Response to User                          │
-│  • Citations [source:row-X]                              │
-│  • Session History Persisted                             │
-│  • Metrics Collected                                     │
-└──────────────────────────────────────────────────────────┘
-```
+- **Grounded or silent.** Every factual claim must carry a `[source:ID]` citation. An answer that cites something it didn't retrieve, or that an LLM judge decides isn't actually supported by the context, gets replaced with a safe refusal — never a guess.
+- **Multi-turn aware.** Follow-up questions ("what about a cheaper one?") get rewritten into standalone questions using recent chat history before retrieval runs.
+- **Provider-agnostic.** LLM provider (Groq / Google Gemini / HuggingFace) and embedding provider are both swappable via config, with env-var overrides for the LLM side so you can hop providers mid-incident without a redeploy.
+- **Degrades loudly, never silently.** Redis unavailable → in-memory fallback, logged. Cohere unavailable → lexical reranking, logged as a warning on every query. Langfuse unset → tracing becomes a no-op. Nothing silently produces degraded behavior without saying so in the logs.
 
 ---
 
-## 📂 Project Structure
+## 2. Tech stack
+
+| Layer | Choice | Notes |
+|---|---|---|
+| API framework | FastAPI + Uvicorn | Single process, `--reload` for dev |
+| LLM (generation + query rewrite) | Groq (`llama-3.3-70b-versatile` / `llama-3.1-8b-instant`) | Swappable to Google Gemini or HuggingFace via `LLM_PROVIDER` env var |
+| Embeddings | `sentence-transformers/all-MiniLM-L6-v2`, local (HuggingFace) | Runs on-box, zero API quota risk |
+| Vector store | Chroma Cloud | No local fallback once cloud creds are set — see [§9](#9-vector-store--chroma) |
+| Keyword search | BM25 (`rank_bm25`), JSON index in object storage | Runs alongside dense search, merged via RRF |
+| Reranking | Cohere Rerank (`rerank-english-v3.0`), optional | Falls back to lexical term-overlap reranking if unset |
+| Cache / sessions / rate limiting | Redis, in-memory fallback | `fakeredis` used for tests |
+| Semantic cache gate | Cross-encoder NLI (`cross-encoder/nli-deberta-v3-small`), local | See [§8.3](#83-semantic-cache--the-nli-gate) — this is the most subtle piece of the whole system |
+| Observability | Langfuse (v3+, OTel-based) + structured JSON request logs | Every request scored for citation/groundedness, not just eval runs |
+| Evaluation | RAGAS (if installed) + a fast fallback, 12-case golden set | Gates CI on regression |
+| Deployment target | GKE (Terraform-provisioned) | See [§12](#12-deployment) |
+
+---
+
+## 3. Architecture
+
+```mermaid
+flowchart TD
+    U["User (web UI / API client)"] -->|"POST /get or /get/stream<br/>X-API-Key, X-Session-Id"| MW
+
+    subgraph FastAPI["main.py"]
+        MW["API-key auth + rate limit<br/>(middleware)"]
+        CACHE{"Exact or<br/>semantic<br/>cache hit?"}
+        MW --> CACHE
+    end
+
+    CACHE -->|hit| RESP["Return cached answer<br/>(skip everything below)"]
+    CACHE -->|miss| REWRITE
+
+    subgraph Rewrite["retriever/query_rewriter.py"]
+        REWRITE["Contextualize query<br/>using last 4 chat turns<br/>(small/fast LLM)"]
+    end
+
+    REWRITE --> RETRIEVE
+
+    subgraph Retrieval["retriever/retrieval.py"]
+        direction TB
+        DENSE["Dense search<br/>(Chroma Cloud)"]
+        SPARSE["BM25 keyword search"]
+        RETRIEVE["call_retriever()"] --> DENSE
+        RETRIEVE --> SPARSE
+        DENSE --> RRF["Reciprocal Rank Fusion merge"]
+        SPARSE --> RRF
+        RRF --> RERANK{"COHERE_API_KEY<br/>set?"}
+        RERANK -->|yes| COHERE["Cohere semantic rerank"]
+        RERANK -->|no| LEXICAL["Lexical term-overlap<br/>rerank (logged warning)"]
+    end
+
+    COHERE --> GEN
+    LEXICAL --> GEN
+
+    subgraph Generation["prompt_library/prompt.py + utils/model_loader.py"]
+        GEN["product_bot prompt<br/>context in &lt;doc source=...&gt; tags<br/>temperature=0"]
+    end
+
+    GEN --> GUARD
+
+    subgraph Guardrails["main.py"]
+        GUARD["Citation check:<br/>cited source_id actually retrieved?"]
+        GUARD -->|fail| REFUSE["Insufficient context<br/>(not cached)"]
+        GUARD -->|pass| JUDGE["LLM-as-judge:<br/>groundedness_verdict"]
+        JUDGE -->|fail| REFUSE
+        JUDGE -->|pass| OK["Answer accepted"]
+    end
+
+    OK --> WRITE["Write exact + semantic cache<br/>Append session history<br/>Emit RequestTrace + Langfuse span"]
+    WRITE --> RESP
+    REFUSE --> RESP2["Return refusal<br/>(session history still updated,<br/>cache NOT written)"]
+```
+
+### Text version (for a quick skim)
 
 ```
-custmor_support_system-main/
-├── 📄 main.py                              (~150 lines)
-│   └─ FastAPI application with routes, middleware, session management
-│
-├── 📦 config/
-│   └─ config.yaml                          (Model, retrieval, ingestion settings)
-│
-├── 📦 data/
-│   ├─ flipkart_product_review.csv          (450 product reviews)
-│   ├─ .ingestion_state.json                (Processed document tracking)
-│   └─ .keyword_index.json                  (BM25 token index)
-│
-├── 📦 data_ingestion/
-│   └─ ingestion_pipeline.py                (~280 lines)
-│      ├─ Chunk documents with overlap
-│      ├─ SHA256-based deduplication
-│      ├─ Incremental state tracking
-│      └─ Upsert to Chroma with fallback
-│
-├── 📦 retriever/
-│   └─ retrieval.py                         (~230 lines)
-│      ├─ Query rewriting & synonym expansion
-│      ├─ Metadata filter parsing
-│      ├─ Parallel dense + keyword search
-│      ├─ RRF merging & reranking
-│      └─ Dynamic top-k selection
-│
-├── 📦 prompt_library/
-│   └─ prompt.py                            (System prompts with citations)
-│
-├── 📦 utils/
-│   ├─ model_loader.py                      (LLM & embedding initialization)
-│   ├─ config_loader.py                     (YAML configuration)
-│   └─ chroma_utils.py                      (Cloud ↔ Local storage routing)
-│
-├── 📦 templates/
-│   └─ chat.html                            (Web UI with session management)
-│
-├── 📦 static/
-│   └─ style.css                            (Styling)
-│
-├── 📦 evaluation/
-│   ├─ golden_test_set.py                   (3 curated test cases)
-│   ├─ evaluator.py                         (~110 lines)
-│   │  ├─ Context Precision
-│   │  ├─ Context Recall
-│   │  ├─ Faithfulness (token overlap)
-│   │  └─ Answer Relevance (keyword coverage)
-│   ├─ run_evaluation.py                    (End-to-end evaluation)
-│   └─ README.md                            (Evaluation documentation)
-│
-├── 📦 tests/
-│   ├─ test_phase0_security.py              (2 tests - auth, token stripping)
-│   ├─ test_phase1_ingestion.py             (2 tests - chunking, dedup)
-│   ├─ test_phase2_retrieval.py             (3 tests - filters, rewriting, RRF)
-│   ├─ test_phase3_grounding.py             (2 tests - reasoning, prompts)
-│   ├─ test_phase4_evaluation.py            (4 tests - metrics, end-to-end)
-│   └─ test_phase4_ci.py                    (3 tests - CI quality gates)
-│
-├── 📦 .github/workflows/
-│   └─ evaluation.yml                       (CI/CD pipeline)
-│
-├── 📄 requirements.txt
-├── 📄 setup.py
-├── 📄 Dockerfile
-├── 📄 .env
-├── 📄 .dockerignore
-├── 📄 .gitignore
-├── 📄 README.md
-├── 📄 LAUNCH_GUIDE.md                      (← YOU ARE HERE)
-└── 📄 notebook/
-    └─ custmor_support.ipynb                (Exploratory notebook)
+User
+ -> FastAPI middleware: X-API-Key auth, per-identity rate limit
+ -> Exact cache check (Redis, keyed on session_id + normalized raw query)
+ -> Semantic cache check (cosine pre-filter -> NLI entailment gate)
+      | hit -> return cached answer, skip everything below
+      v miss
+ -> Query rewrite (only if chat history exists): resolve pronouns/negation/
+    multi-item references into a standalone question
+ -> Hybrid retrieval: dense (Chroma) + BM25, run concurrently, merged by RRF
+ -> Rerank: Cohere if configured, else lexical term-overlap fallback
+ -> Generation: product_bot prompt, context as untrusted <doc> blocks,
+    temperature=0, citation required
+ -> Citation check -> Groundedness judge (LLM-as-judge)
+      | either fails -> "Insufficient context" (never cached)
+      v both pass
+ -> Cache write (exact + semantic) + session history append
+ -> RequestTrace JSON log + Langfuse span
+ -> Response to user (plain text or SSE token stream)
 ```
 
 ---
 
-## 🎯 Complete Feature Set
+## 4. Repository structure
 
-### Phase 0: Security ✅
-- API key authentication (X-API-Key header)
-- CORS protection (explicit allowed origins)
-- Reasoning token stripping (`<think>...</think>`)
-- Safe error handling (502 fallback)
-- Secret management (no logging)
-
-### Phase 1: Ingestion ✅
-- Document chunking (400-token chunks, 80 overlap)
-- Metadata preservation (rating, product_name, source_id, etc.)
-- SHA256-based deduplication
-- Incremental state tracking (`.ingestion_state.json`)
-- BM25 keyword index generation
-- Result: 450 → 542 documents
-
-### Phase 2: Retrieval ✅
-- Dense search (HuggingFace embeddings → Chroma)
-- Keyword search (BM25-style from token index)
-- Query rewriting (synonym expansion)
-- Metadata filter parsing (rating >= 4, category:headphones)
-- RRF merging (Reciprocal Rank Fusion with k=60)
-- Token-overlap reranking
-- Dynamic top-k (3-5 documents)
-
-### Phase 3: Generation & Grounding ✅
-- Multi-turn conversation (session memory)
-- Chat history context (last 4 turns)
-- Grounded prompts (require citations)
-- LLM judge for faithfulness
-- Fallback path (insufficient context)
-- Reasoning token stripping
-
-### Phase 4: Evaluation ✅
-- Golden test set (3 curated cases)
-- RAGAS-style lightweight metrics
-  - Context Precision (what % retrieved docs are relevant)
-  - Context Recall (did we get all needed docs)
-  - Faithfulness (token overlap with context)
-  - Answer Relevance (keyword coverage)
-- End-to-end evaluation pipeline
-- CI quality gates
-- Results export to JSON
+```
+main.py                        FastAPI app: routes, auth, the whole request pipeline
+config/
+  config.yaml                  Provider, retrieval, ingestion settings
+  config_loader.py
+retriever/
+  retrieval.py                 Hybrid search, RRF, reranking, metadata filters
+  query_rewriter.py            Multi-turn query contextualization
+data_ingestion/
+  ingestion_pipeline.py        Incremental ingest: land -> clean -> chunk -> dedupe -> embed
+utils/
+  model_loader.py               LLM/embedding provider loading + caching (groq/google/huggingface)
+  chroma_utils.py                Chroma Cloud vs local persistence routing
+  ops.py                         ResponseCache, RateLimiter, SessionStore (Redis-backed,
+                                  in-memory fallback), request tracing, Langfuse wiring,
+                                  NLI-gated semantic cache
+  bm25_index.py                  BM25 index persistence
+  object_store.py                Storage abstraction (local / gs:// / s3:// / abfs://)
+  config_loader.py
+prompt_library/
+  prompt.py                     System prompts: generation, groundedness judge, query rewrite
+evaluation/
+  golden_test_set.py             12 labeled test cases
+  evaluator.py                   Retrieval + generation metrics (RAGAS or fallback)
+  run_evaluation.py              Runs golden set, gates CI on regression vs. baseline
+tests/                          82 tests (fast, dependency-free, except test_phase4_ci.py
+                                 which hits real providers)
+templates/, static/             Web chat UI (vanilla HTML/JS, no framework)
+deploy/k8s.yaml                 GKE Deployment/Service/HPA/SecretProviderClass manifest
+.github/workflows/
+  main.tf, variables.tf,
+  backend.tf, outputs.tf         Terraform: GKE cluster, Artifact Registry, IAM,
+                                  Workload Identity Federation for CI/CD
+  deploy-to-gke.yml              Build + push + deploy pipeline
+  evaluation.yml                 CI: runs tests + evaluation on every push
+Dockerfile, docker-compose.yml  Container build + local compose (no local Redis by design)
+```
 
 ---
 
-## 🚀 Launch Instructions
+## 5. API reference
 
-### Quick Start (3 minutes)
+All routes defined in `main.py`. Base URL in local dev: `http://localhost:8001`.
 
-```bash
-# 1. Activate virtual environment
-cd /Users/gauravsingh/Downloads/custmor_support_system-main
-source .venv/bin/activate
+### Auth
 
-# 2. Configure .env
-export GROQ_API_KEY=<your-groq-key>
-export APP_API_KEY=test-local-key
+Every request to `/get` and `/get/stream` must carry:
 
-# 3. Launch app
-uvicorn main:app --reload --port 8001
-
-# 4. Open browser
-# http://localhost:8001
+```
+X-API-Key: <APP_API_KEY value>
 ```
 
-### Use Cases
+Checked with `secrets.compare_digest` (timing-safe). Missing/wrong key → `401`. `APP_API_KEY` unset server-side → `503` (fails closed, not open). Also enforced: **per-identity rate limiting** (`RateLimiter`, keyed on the API key itself, or client IP if no key — default 30 requests / 60s window), returning `429` when exceeded.
 
-**Web UI:**
-- Open http://localhost:8001
-- Enter API key: `test-local-key`
-- Ask: "Can you recommend a good budget headphone?"
+### `GET /`
+Renders the chat UI (`templates/chat.html`). No auth.
 
-**API (cURL):**
+### `GET /health`
+Liveness probe. Always `{"status": "healthy"}` if the process is up. No auth, no dependency checks — used as the Kubernetes `livenessProbe`.
+
+### `GET /ready`
+Readiness probe — actually checks dependencies: `APP_API_KEY` set, `GROQ_API_KEY` set, Chroma storage reachable/configured. Returns `503` if any check fails. Used as the Kubernetes `readinessProbe`.
+
+```json
+{"status": "ready", "checks": {"app_api_key": true, "groq_api_key": true, "chroma_storage": true}}
+```
+
+### `POST /get`
+Single-turn or multi-turn (via `X-Session-Id`) chat, plain-text response.
+
+**Headers:** `X-API-Key` (required), `X-Session-Id` (optional, defaults to `"default"` — see [Known limitation](#known-limitations) about the web UI not sending this).
+
+**Body (form-encoded):** `msg` (string, 1-2000 chars).
+
 ```bash
 curl -X POST http://localhost:8001/get \
-  -H "X-API-Key: test-local-key" \
+  -H "X-API-Key: $APP_API_KEY" \
   -H "X-Session-Id: user-123" \
-  -d "msg=Best earbuds under 2000?"
+  --data-urlencode "msg=Can you recommend a good budget headphone?"
 ```
 
-**Python:**
-```python
-import requests
+Response: the answer as plain text (may be the "Insufficient context..." refusal).
 
-response = requests.post(
-    "http://localhost:8001/get",
-    data={"msg": "Tell me about wireless headsets"},
-    headers={
-        "X-API-Key": "test-local-key",
-        "X-Session-Id": "user-456"
-    }
-)
-print(response.text)
+### `POST /get/stream`
+Same request shape as `/get`, but Server-Sent Events (SSE) response — used by the web UI for token-by-token streaming.
+
+**Event sequence:**
 ```
+event: request_id
+data: <uuid>
+
+event: status
+data: retrieving
+
+event: cache
+data: miss | exact | semantic
+
+event: token
+data: <word> 
+... (repeated, one per whitespace-split word — NOT true incremental LLM
+     streaming; the full answer is generated first, then replayed word by
+     word for a typing-effect UI)
+
+event: done
+data: [DONE]
+```
+
+Note: `[DONE]` is sent regardless of success/refusal — a refusal is a normal, complete answer from the API's perspective, not an error.
 
 ---
 
-## ✅ Verification & Testing
+## 6. Query flow, in detail
 
-### Test Suite Status
-```
-Phase 0 (Security):     2 tests ✓
-Phase 1 (Ingestion):    2 tests ✓
-Phase 2 (Retrieval):    3 tests ✓
-Phase 3 (Grounding):    2 tests ✓
-Phase 4 (Evaluation):   4 tests ✓
-Phase 4 (CI):           3 tests ✓ (1 skipped)
-────────────────────────────────
-Total:                 15 tests (1 skipped)
-Status:                100% PASSING
-```
+This is `main.py`'s `invoke_chain_details()` — the one function every request (streaming or not) funnels through.
 
-### Run All Tests
-```bash
-.venv/bin/python -m unittest discover tests -p "test_phase*.py" -v
-```
+1. **Trace + Langfuse span opened.** A `RequestTrace` object accumulates timing/metadata for the structured JSON log line emitted at the end. `build_langfuse_trace()` opens a matching span (no-op if Langfuse keys unset), with a trace ID deterministically derived from the request's own ID — so a log line and a Langfuse trace can always be cross-referenced.
 
-### Run Evaluation
-```bash
-.venv/bin/python evaluation/run_evaluation.py
-# → evaluation/results.json
-```
+2. **Query embedded** (`_embed_query`) — needed for the semantic cache check regardless of hit/miss. This is cached per-`ModelLoader`-instance (see [§10.1](#101-provider-client-caching)); it used to reconstruct the embedding model from scratch on every call.
 
-### Expected Metrics
-- **Context Precision**: 0.6-0.8 (60-80% of retrieved docs are relevant)
-- **Context Recall**: 0.6-0.8 (capturing necessary docs)
-- **Faithfulness**: 0.7-0.9 (answers follow from context)
-- **Answer Relevance**: 0.6-0.8 (answers address questions)
+3. **Exact cache check** (`ResponseCache.get_exact`) — keyed on `sha256(session_id + normalize(raw_query))`. Case/whitespace-insensitive, but otherwise requires the literal same text.
 
----
+4. **Semantic cache check** (`ResponseCache.get_semantic`, only if exact missed) — see [§8.3](#83-semantic-cache--the-nli-gate) for why this is more than a similarity threshold.
 
-## 📈 Performance Characteristics
+5. **On any cache hit:** append to session history, log, return immediately. **Retrieval and generation are entirely skipped.**
 
-| Metric | Value |
-|--------|-------|
-| **Retrieval Latency** | 200-500ms |
-| **LLM Generation** | 1-3s |
-| **Total E2E Response** | 1.5-4s |
-| **Memory (at rest)** | 300-500MB |
-| **Memory (under load)** | 600-800MB |
-| **Concurrent Sessions** | 10+ (single worker) |
-| **Throughput** | 5-10 req/sec |
-| **Vector DB Size** | 50MB (542 docs) |
+6. **On a miss:** build chat history (`_build_chat_history`, last 4 turns, citations stripped — see [§7](#7-citation-stripping-in-chat-history) for why).
+
+7. **Retrieval** (`retriever_obj.call_retriever`) — see [§8](#8-retrieval-in-detail).
+
+8. **Generation** — `product_bot` prompt (see [§9.2](#92-the-generation-prompt)), `temperature=0`, context passed as `<doc source="ID">...</doc>` blocks.
+
+9. **Guardrails, in order:**
+   - If retrieval returned nothing → immediate refusal, no LLM guardrail calls needed.
+   - **Citation check** (`_verify_citations`) — regex-extracts every `source:ID` token from the answer (not just whole `[...]` brackets — a model bundling multiple citations into one bracket, e.g. `[source:A, source:B]`, is handled) and checks each against the set of actually-retrieved source IDs. Any mismatch → refusal.
+   - **Groundedness judge** (`_judge_groundedness`) — a separate LLM call, strict YES/NO, asks "is this answer actually supported by this context?" Independent of the citation check — an answer can cite real IDs but still misrepresent what they say.
+   - Either check failing → the answer is replaced with one of two fixed refusal strings (`INSUFFICIENT_CONTEXT_NO_DOCS` / `INSUFFICIENT_CONTEXT_UNGROUNDED`), never the model's actual (possibly ungrounded) text.
+
+10. **Cache write** — **only if the output is not a refusal.** A citation/groundedness failure is often transient (LLM sampling variance), so caching it would make the refusal "sticky" for the whole TTL, refusing a genuinely answerable question repeatedly until expiry.
+
+11. **Session history append** — happens unconditionally (even for a refusal — the conversation did happen).
+
+12. **Trace finished, Langfuse span closed** with `citation_check`/`groundedness` recorded as first-class Langfuse *scores* (chartable trend lines, not buried metadata).
 
 ---
 
-## 🔧 Configuration
+## 7. Citation stripping in chat history
 
-### Model Selection
-Edit `config/config.yaml`:
-
-```yaml
-llm:
-  provider: "groq"
-  model_name: "deepseek-r1-distill-llama-70b"  # ⚠️ DECOMMISSIONED
-  # Options: "mixtral-8x7b-32768", "llama3-70b-8192", etc.
-  # Check: https://console.groq.com/docs/deprecations
-
-embedding_model:
-  provider: "huggingface"
-  model_name: "sentence-transformers/all-MiniLM-L6-v2"
-  # 384-dimensional embeddings
-
-retriever:
-  top_k: 10
-  hybrid: true
-  rerank_top_k: 5
-
-ingestion:
-  chunk_size: 400
-  chunk_overlap: 80
-```
-
-### Environment Variables
-```bash
-# Required
-APP_API_KEY=test-local-key
-GROQ_API_KEY=gsk_xxxxx
-
-# Optional
-CHROMA_API_KEY=<cloud-key>
-CHROMA_TENANT=<tenant>
-CHROMA_DATABASE=<database>
-ALLOWED_ORIGINS=http://localhost:8001
-
-# Storage mode
-CHROMA_STORAGE_MODE=auto  # or "local" / "cloud"
-```
+`_strip_citations()` removes `[source:ID]` markers before an answer is replayed into a *future* prompt as chat history. Without this, a weaker model tends to copy a source ID forward from a previous turn's answer and cite it against the *current* turn's freshly-retrieved (and likely different) context — a citation that looks fabricated and gets correctly rejected by `_verify_citations`, producing a false refusal on a question the model could otherwise answer fine purely from history.
 
 ---
 
-## 🐛 Troubleshooting
+## 8. Retrieval, in detail
 
-| Issue | Solution |
-|-------|----------|
-| "Invalid API key" | Check `APP_API_KEY` in `.env` and browser UI |
-| "Failed to connect to LLM" | Verify `GROQ_API_KEY` is valid and network is available |
-| "Insufficient context" | This is correct behavior—question couldn't be answered confidently |
-| "Chroma quota exceeded" | Set `CHROMA_STORAGE_MODE=local` in `.env` |
-| "Port 8001 in use" | Run on different port: `--port 8002` |
-| "ModuleNotFoundError" | Reinstall: `pip install --upgrade -r requirements.txt` |
+`retriever/retrieval.py`'s `Retriever.call_retriever()`:
 
----
+1. **Query rewrite** (`contextualize_query`, `retriever/query_rewriter.py`) — skipped entirely if there's no chat history yet (first turn). Uses a small/fast model (`llama-3.1-8b-instant` by default) with an explicit prompt contract:
+   - Resolve pronouns/implicit references ("the cheaper one") using history.
+   - **Preserve polarity exactly** — a negated follow-up ("do they sound bad?") must not get flipped positive just because prior history leaned positive. (Found and fixed 2026-07-14 — see [§13](#13-recent-hardening-2026-07-14).)
+   - **Don't collapse an ambiguous singular reference onto one item** — "tell me more about it" after the assistant listed several distinct products should expand to name all of them, not silently pick the last one mentioned. (Also fixed 2026-07-14; known to still have a downstream retrieval-precision limitation — see [§14](#14-known-limitations--parked-work).)
 
-## 📦 Deployment
+2. **Lexical query expansion** (`rewrite_query`) — a fixed synonym table (`headphone` → `headphones earphones earbuds`, `budget` → `budget affordable cheap low cost`, etc.), applied to the rewritten query before search. Deliberately dumb/deterministic, not LLM-based.
 
-### Docker
-```bash
-docker build -t customer-support-rag:latest .
-docker run -p 8001:8001 \
-  -e GROQ_API_KEY=$GROQ_API_KEY \
-  -e APP_API_KEY=$APP_API_KEY \
-  -v chroma_db:/app/chroma_db \
-  customer-support-rag:latest
-```
+3. **Metadata filter parsing** (`parse_metadata_filters`) — regex-extracts `field OP value` patterns like `rating>=4` from the *original* (not rewritten) query. Supported fields: `rating`, `price`, `category`, `product_name`, `brand`. **Only `rating` actually matches anything against the bundled demo dataset** — the CSV has no price/category/brand columns (see [Known limitations](#14-known-limitations--parked-work)).
 
-### Cloud Platforms
-- **Render**: Push to GitHub, connect repo, set env vars → Deploy
-- **Railway**: Same process
-- **AWS/Azure**: Use Docker image + container orchestration
+4. **Hybrid search, run concurrently** (`ThreadPoolExecutor`, 2 workers):
+   - **Dense**: Chroma similarity search via `retriever.invoke()`.
+   - **Sparse**: BM25 keyword search (`utils/bm25_index.py`), index reloaded from storage at most every 60s (`BM25_REFRESH_SECONDS`) since it's rebuilt by the ingestion job, not this process.
+   - Candidate pool size (`_candidate_pool_top_k`): 20 if Cohere reranking is active, 10 otherwise — a real semantic reranker benefits from more candidates; the crude lexical fallback reranker gets *worse* with more (more chances for an irrelevant-but-lexically-similar doc to outrank the genuinely relevant one).
+
+5. **Metadata filters applied** to both result sets independently.
+
+6. **Reciprocal Rank Fusion merge** (`rrf_merge`, k=60) — standard RRF scoring (`1/(k + rank + 1)` per list, summed), not a naive concatenation, so a document ranked highly in *both* dense and sparse search outranks one that only one method liked.
+
+7. **Rerank** (`_rerank`):
+   - Cohere Rerank if `COHERE_API_KEY` set (with an optional relevance-score floor).
+   - Cohere call failing at runtime → caught, falls back to lexical.
+   - No key at all → lexical term-overlap reranking (`rerank_documents`), logged as a **warning on every single query** so this degraded mode is never silent. Final count via `dynamic_top_k` (3/4/5 depending on candidate pool size).
 
 ---
 
-## 📊 API Reference
+## 9. Generation
 
-### GET `/`
-Returns HTML chat interface.
+### 9.1 Vector store: Chroma
 
-```bash
-curl http://localhost:8001/
-```
+`utils/chroma_utils.py`'s `create_chroma_store()`. Key decision: **once cloud credentials are configured, cloud is used unconditionally — there is no silent fallback to local storage on a cloud error.** A quota/timeout/auth failure surfaces as a loud `RuntimeError`, not a quiet fork into a second, divergent local index that only one replica can see. Local persistence (`chroma_db/` folder) is reached *only* when no cloud credentials exist anywhere and no explicit mode is set — logged as a warning so nobody mistakes it for the cloud store.
 
-### POST `/get`
-Submit question and get answer (protected).
+### 9.2 The generation prompt
 
-**Headers:**
-- `X-API-Key`: API key (required)
-- `X-Session-Id`: Session ID (optional, defaults to "default")
+`prompt_library/prompt.py`'s `product_bot` template:
 
-**Form Data:**
-- `msg`: Question text (1-2000 characters)
+- Context passed as `<doc source="ID">...</doc>` blocks, explicitly labeled **untrusted, not instructions** — a direct prompt-injection defense: review text is user-generated and could contain an embedded instruction ("ignore previous instructions and..."), and the prompt tells the model to treat it purely as evidence, never as directives, even if it claims to be from "the system."
+- Every factual claim must carry a `[source:ID]` citation.
+- Explicit instruction to say "Insufficient context" rather than guess.
+- **Completeness instruction** (added 2026-07-14): when a follow-up asks to recall/list something from chat history, the model must account for *every* relevant item mentioned there, not just the most prominent one — direct fix for an observed bug where a 3-item recommendation got recalled as if it were 1-item.
 
-**Example:**
-```bash
-curl -X POST http://localhost:8001/get \
-  -H "X-API-Key: test-local-key" \
-  -H "X-Session-Id: user-123" \
-  -d "msg=Best headphones under 3000?"
-```
+### 9.3 Determinism
 
-**Response:**
-```
-BoAt Rockerz 235v2 offers great value under 3000 with good sound quality. 
-It has Bluetooth 5.0, 30-hour battery life, and dual pairing support. 
-[source:row-15] [source:row-42]
-```
-
-### GET `/docs`
-Interactive OpenAPI documentation (Swagger UI).
-
-```
-http://localhost:8001/docs
-```
+`ModelLoader.load_llm()` sets `temperature=0` across all three providers (Groq: `temperature=0`; Google: `temperature=0`; HuggingFace: `do_sample=False` — HF's TGI-based endpoints typically reject `temperature=0` outright, so greedy decoding is requested the correct way for that provider instead). Added 2026-07-14 after observing the same question asked twice in one session produce meaningfully different answers. **This tightens but does not fully eliminate variance** — retrieval became fully deterministic (identical `retrieved_source_ids` across repeats) but generation still shows minor differences occasionally, most likely because Groq's serving infrastructure uses continuous batching, and floating-point ops aren't strictly associative across different batch compositions — a ceiling on determinism inherent to any shared, high-throughput inference API, not fixable from this codebase.
 
 ---
 
-## 🎓 What You Can Ask
+## 10. Provider loading, caching, and quota management
 
-**Good Questions:**
-- "Can you recommend headphones under 2000?"
-- "What are the best wireless earbuds?"
-- "Tell me about products with rating above 4"
-- "Which headsets have the best battery life?"
-- "What products are from brand XYZ?"
+`utils/model_loader.py`'s `ModelLoader` is the single point of LLM/embedding provider selection.
 
-**Multi-turn:**
-- User: "What headphones do you recommend?"
-- Assistant: [Answer with sources]
-- User: "Do they have noise cancellation?"
-- Assistant: [Answer considers prior context]
+### 10.1 Provider client caching
 
----
+**This was the single biggest latency bug found in this project.** `load_embeddings()` and `load_llm()` originally reconstructed their client objects from scratch on *every call* — for embeddings specifically, that meant reloading the full sentence-transformer model from disk into memory on every single chat request (measured: **5.6–7.4s per call**, vs. **~7ms** when reused). Both are now cached:
 
-## 🔐 Security
+- `load_embeddings()` — cached as `self._embeddings`, a single instance per `ModelLoader` object.
+- `load_llm()` — cached in `self._llm_cache`, keyed by `(provider, model_name)`, since the same instance is called with different models (main generation vs. groundedness judge vs. — in `Retriever` — the query-rewrite model).
 
-✅ **Implemented:**
-- API key authentication on protected endpoints
-- CORS locked to explicit origins
-- Safe error responses (no stack traces)
-- No secret logging
-- Session isolation
-- Reasoning token stripping
+Net effect: warm-request latency dropped roughly 4x (measured **7.9–8.5s → 2.0–2.1s**) in live testing.
 
-⚠️ **To Consider:**
-- Rate limiting (add to middleware)
-- Input validation (currently 2000 char max)
-- Audit logging (log all API calls)
-- HTTPS in production (use reverse proxy)
+### 10.2 Provider quick-switch
+
+`LLM_PROVIDER` / `LLM_MODEL_NAME` / `LLM_REWRITE_MODEL_NAME` env vars take precedence over `config.yaml` whenever set — a one-line env change instead of an edit + redeploy when a provider's quota is hit mid-session. Embedding provider is **deliberately not** switchable this way: changing it means re-ingesting into a new Chroma collection (different embedding models = incompatible vector spaces), so that stays a considered `config.yaml` edit, not a quick env flip.
+
+### 10.3 Provider quota realities (learned firsthand)
+
+| Provider | Failure mode | Notes |
+|---|---|---|
+| Groq | Daily token cap (~100k TPD observed on `llama-3.3-70b-versatile`) | Resets on a fixed daily cycle, not rolling. Heavy automated testing burns through it fast. |
+| Google (Gemini) | Free tier only if the API key's project has **no Cloud Billing account linked** | A billing-linked project draws from a separate "Prepay" balance; hitting $0 there gives a different, easy-to-miss `RESOURCE_EXHAUSTED` error. |
+| HuggingFace | Small **monthly** credit pool via the serverless Inference router, separate from the other two | A single eval run against a 70B model can exhaust it. Embeddings via HF run **locally** (no API, no quota risk — the most robust of the three for that specific role). |
 
 ---
 
-## 📚 Documentation
+## 11. Caching architecture
 
-| Document | Purpose |
-|----------|---------|
-| [README.md](README.md) | Project overview & phase roadmap |
-| [LAUNCH_GUIDE.md](LAUNCH_GUIDE.md) | Complete setup & usage instructions |
-| [evaluation/README.md](evaluation/README.md) | Evaluation framework details |
-| [config/config.yaml](config/config.yaml) | Model & system configuration |
-| [.github/workflows/evaluation.yml](.github/workflows/evaluation.yml) | CI/CD pipeline |
+`utils/ops.py`. Three independent Redis-backed subsystems, all with a graceful in-memory fallback (logged loudly) when `REDIS_URL` is unset.
 
----
+### 11.1 SessionStore
+Per-session chat history (`rag:session:{id}` list in Redis). `append()`/`get_recent(limit)`. Trimmed to `SESSION_MAX_TURNS` (default 20), expires after `SESSION_TTL_SECONDS` (default 86400). Only the last 4 turns are ever pulled into a prompt (`main.py:_build_chat_history`).
 
-## 🎯 Next Steps
+### 11.2 RateLimiter
+Fixed-window counter (`rag:rate:{identity}`), default 30 requests / 60s. `INCR` + `EXPIRE` on first hit.
 
-### To Deploy to Production
-1. **Update Groq Model** (current model is decommissioned)
-   - Edit `config/config.yaml`
-   - Check: https://console.groq.com/docs/deprecations
+### 11.3 ResponseCache — exact match
+`rag:exact:{sha256(session_id + normalized_query)}`, JSON payload, TTL = `CACHE_TTL_SECONDS` (default 3600). **Never written for a refusal answer** (fixed 2026-07-14 — see [§13](#13-recent-hardening-2026-07-14)).
 
-2. **Expand Golden Test Set**
-   - Add 5-10 real customer questions to `evaluation/golden_test_set.py`
-   - Run evaluation to get baseline metrics
+### 11.4 ResponseCache — semantic match, and the NLI gate
 
-3. **Install RAGAS (Optional)**
-   - `pip install ragas`
-   - Updates `evaluation/evaluator.py` for deeper metrics
+This is the most non-obvious piece of engineering in the codebase, worth understanding in full.
 
-4. **Set Up Monitoring**
-   - Add health check endpoint
-   - Log all API calls
-   - Track response latency
-   - Monitor error rates
+**The naive version** (raw cosine similarity threshold) was tested live and found to have a serious correctness bug: on `all-MiniLM-L6-v2`, a genuine paraphrase ("sound quality" vs. "audio quality") scored **0.89** cosine similarity — while a **negated opposite** ("good battery life" vs. "poor battery life") scored **0.95–0.98**, *higher* than the real paraphrase. There is no single cosine threshold that accepts paraphrases while rejecting negated opposites — negation barely moves embedding space for this model class, a well-known limitation, not a tuning problem.
 
-5. **Configure Production Environment**
-   - Use environment-specific `.env` files
-   - Set HTTPS/TLS
-   - Enable rate limiting
-   - Add request logging
+**The fix**, implemented in `utils/ops.py`:
+
+1. `rag:semantic:index` (a Redis list, capped at `SEMANTIC_CACHE_MAX_ENTRIES`, session-scoped) stores each cached query's normalized text + embedding.
+2. `get_semantic()` first does a **cheap cosine pre-filter** — `SEMANTIC_CACHE_CANDIDATE_THRESHOLD` (default `0.80`), just to shortlist candidates worth the more expensive check. This is *not* the hit decision.
+3. Candidates are ranked by cosine descending; the top `SEMANTIC_CACHE_MAX_NLI_CHECKS` (default 5) are checked with `_is_paraphrase()` — a cross-encoder NLI model (`cross-encoder/nli-deberta-v3-small`, `SEMANTIC_CACHE_NLI_MODEL` env-overridable), run **bidirectionally**: entailment required forward (cached query → incoming), no contradiction required reverse. Both directions matter — on a tested negation pair, one direction alone gave a weak/ambiguous signal, but the other correctly flagged contradiction.
+4. First candidate to pass wins. None pass → genuine cache miss, falls through to full retrieval+generation.
+5. The NLI model itself is a **lazy-loaded module-level singleton** (`_get_nli_model()`) — loaded once per process (~5.3s, ~552MB on disk), not per call (~32ms per subsequent `_is_paraphrase()` call).
+
+Cost profile: zero API/monetary cost (runs locally, same as embeddings), ~500MB-1GB additional RAM while loaded, negligible per-request latency once warm.
+
+### 11.5 Langfuse client
+`build_langfuse_trace()`/`finish_langfuse_trace()` — also fixed to a module-level singleton 2026-07-14 (was previously reconstructing the `Langfuse()` client, with its OTel exporter setup, on every request — measured ~5.9s, which was the dominant cost on a cache hit specifically, since everything else on that path is fast).
 
 ---
 
-## ✨ Summary
+## 12. Deployment
 
-| Aspect | Status |
-|--------|--------|
-| **Code Quality** | ✅ Production-ready |
-| **Testing** | ✅ 15/15 tests passing |
-| **Documentation** | ✅ Comprehensive |
-| **Security** | ✅ API key + CORS |
-| **Performance** | ✅ <4s E2E latency |
-| **Scalability** | ✅ Ready for load balancing |
-| **Error Handling** | ✅ Safe fallbacks |
-| **Deployment** | ✅ Docker + CI/CD |
+- **Container**: `Dockerfile` — `python:3.12-slim`, non-root user, `HEALTHCHECK` against `/health`, CPU-only PyTorch wheel (avoids ~300MB of dead CUDA weight per image). Unchanged by the Cloud Run migration below.
+- **Local multi-container**: `docker-compose.yml` — app + an on-demand `ingest` one-shot job sharing volumes. Deliberately **no local Redis service** — `REDIS_URL` is expected to point at a real managed Redis even in this context.
+- **Deployment target: Cloud Run** (`infra/`), migrated 2026-07-15 from an earlier GKE-based setup. See `infra/README.md` for the full module/environment layout. Summary:
+  - Three environments — dev, test, prod — each a separate Terraform root (`infra/environments/{dev,test,prod}`) with its own state prefix, deploying from `developer`/`staging`/`main` respectively.
+  - GCP is the only implemented provider; `infra/modules/{aws,azure}` are typed interface stubs (zero resources) so a `cloud_provider` Terraform variable is a real, validated extension point without pretending to support clouds this project has no way to test.
+  - Secrets are wired via Cloud Run's native Secret Manager integration (`infra/modules/gcp/secrets` + `cloud-run-service`/`cloud-run-job`'s `secret_key_ref`) — this replaced an earlier, broken `SecretProviderClass`/CSI-driver approach from the GKE era that silently failed to sync for days.
+  - CI/CD (`.github/workflows/cd-{dev,test,prod}.yml`) is branch-triggered and split so the fast, quota-free 82-test unit suite (`ci-fast-tests.yml`) runs on every push/PR, while the quota-heavy live-provider evaluation (`rag-evaluation.yml`) only runs before a prod deploy or on manual dispatch.
+- **Prior GKE deployment (removed)**: an earlier setup deployed to a GKE cluster via `deploy/k8s.yaml` and `.github/workflows/deploy-to-gke.yml`. That cluster was found broken during 2026-07-14 testing (a CSI Secrets Store driver name mismatch caused the app pods to silently fail to start for 3+ days while still billing) and was torn down, along with an associated Memorystore Redis instance and orphaned networking resources. All of it — the K8s manifest, the GKE-specific Terraform, and the old CI workflow — has since been deleted and replaced by the Cloud Run setup above; local testing that day used a temporary Docker Redis container instead of the (now-deleted) managed instance.
 
 ---
 
-## 📞 Support
+## 13. Recent hardening (2026-07-14)
 
-**Having Issues?**
-1. Check [LAUNCH_GUIDE.md](LAUNCH_GUIDE.md) troubleshooting section
-2. Run tests: `.venv/bin/python -m unittest discover tests -v`
-3. Check logs: Add `--log-level debug` to uvicorn command
-4. Verify `.env` has required keys: `GROQ_API_KEY`, `APP_API_KEY`
+A single day's live-testing session surfaced and fixed six distinct issues, in the order found:
+
+1. **Semantic cache negation risk** — raw cosine similarity ranked negated-opposite questions above genuine paraphrases. Fixed with the NLI entailment gate (§11.4).
+2. **Query-rewrite negation flip** — "do they sound bad?" got rewritten to "...good?" when prior chat history leaned positive. Fixed with an explicit polarity-preservation instruction + worked example in the rewrite prompt.
+3. **Three separate per-request reconstruction bugs** — embeddings, LLM clients, and the Langfuse client were all being rebuilt from scratch on every single request instead of cached. Fixed via instance-level and module-level singletons. ~4x warm-request latency improvement.
+4. **Sticky refusal caching** — a transient citation/groundedness failure got cached and kept refusing a genuinely answerable question for the full TTL window. Fixed by never caching a refusal answer.
+5. **Incomplete recall** — "which ones did you just mention?" after a 3-item answer recalled only 1 item. Fixed with an explicit completeness instruction in the generation prompt.
+6. **Ambiguous singular reference** — "tell me more about it" after listing 3 distinct products silently narrowed to the last one mentioned. Fixed in the rewrite prompt to expand to all named items — which in turn surfaced issue #14 below (parked, not yet fixed).
+
+All changes are covered by the existing 82-test suite (all passing) plus 3 new/updated tests specifically covering the NLI-gate negation-rejection behavior.
 
 ---
 
-**Created**: July 9, 2026  
-**Status**: ✅ Production-Ready  
-**Version**: Phase 4 Complete
+## 14. Known limitations / parked work
+
+- **Multi-item retrieval dilution** (found 2026-07-14, parked). Once a follow-up correctly expands to "tell me more about X, Y, and Z," a single combined retrieval query dilutes precision per item — the embedding for "X and Y and Z" retrieves well for whichever product dominates semantically, weakly for the others. The system's own citation/groundedness guardrails correctly refuse to fabricate on the under-retrieved items (safe failure mode) rather than hallucinate, but the answer is incomplete. A real fix means running a separate retrieval pass per named item and merging contexts — genuine architecture work, not a prompt tweak.
+- **The web UI has no per-browser session ID.** `templates/chat.html` never sends `X-Session-Id`, so every browser tab defaults to `session_id="default"` server-side — concurrent web UI users currently share one global conversation. The API-level session isolation works correctly; the UI just doesn't exercise it.
+- **Metadata filters for `price`/`category`/`brand` don't match anything** against the bundled demo dataset (the CSV only has `product_title`/`rating`/`summary`/`review`). `rating>=N` does work. This means the LLM occasionally answers from tangentially-related context on out-of-scope filter questions instead of refusing — correct grounded behavior given what's actually available, just not what a filter query implies.
+- **Cloud Run infrastructure is written but not yet applied.** `infra/` (see §12) validates cleanly (`terraform validate` passes for every module/provider/environment) but `terraform apply` has not been run — no Cloud Run services/jobs/secrets exist in GCP yet, and no Redis instance has been reprovisioned. Applying, populating Secret Manager values, and a first end-to-end deploy are the next steps.
+
+---
+
+## 15. Testing & evaluation
+
+- **`tests/`** — 82 tests, unittest-based, run via `python -m unittest discover tests -p "test_*.py" -v` or `pytest`. All fast and dependency-free (using `fakeredis` for real-Redis-semantics testing without a network dependency, and mocked LLM/NLI calls) except `test_phase4_ci.py`, which instantiates a real `Retriever()` and calls real providers — consumes live quota when run.
+- **`evaluation/`** — a 12-case golden test set (`golden_test_set.py`) spanning recommendation, comparison, metadata-filter, out-of-scope, multi-turn, and prompt-injection cases. `evaluator.py` computes retrieval metrics (precision/recall/MRR) and generation metrics (faithfulness/relevance) — via RAGAS if installed and a reference answer is supplied, else a fast token-overlap fallback that still exercises the real production `_judge_groundedness` function (wired through by `run_evaluation.py`, not a weaker proxy). `run_evaluation.py` runs the full set end-to-end, writes `results.json`, and exits non-zero on regression vs. `baseline_results.json` — this is what gates the `evaluation.yml` CI workflow.
+
+---
+
+## 16. Best practices followed (checklist)
+
+**Correctness / safety**
+- ✅ Refuse rather than guess — citation check + LLM groundedness judge, both independent, either failing triggers a fixed safe-refusal string, never the model's raw (possibly wrong) output.
+- ✅ Never cache a refusal — avoids amplifying a transient failure into a sticky wrong answer for the whole cache TTL.
+- ✅ Semantic similarity gated by NLI entailment, not raw cosine — closes a real negation-confusion vulnerability rather than just tuning a threshold that couldn't actually solve it.
+- ✅ Prompt-injection defense — retrieved content is explicitly wrapped and labeled as untrusted data, never instructions, directly in the generation prompt.
+- ✅ `temperature=0` for reproducible answers to repeated questions.
+- ✅ Timing-safe API key comparison (`secrets.compare_digest`), fails closed if the key is unconfigured.
+
+**Reliability / degradation**
+- ✅ Every external dependency (Redis, Cohere, Langfuse, Chroma Cloud) has a defined fallback behavior, and every fallback is **logged loudly**, never silent.
+- ✅ Chroma: once cloud is configured, no silent fallback to a divergent local store on error — fails loud instead.
+- ✅ Ingestion state persisted after every batch (not just at the end), so a transient failure mid-run only costs a retry of what's left, not a full re-run/re-bill.
+- ✅ Incremental, idempotent ingestion (content-hash dedupe) — safe to re-run.
+
+**Performance**
+- ✅ Dense + sparse retrieval run concurrently (`ThreadPoolExecutor`), not sequentially.
+- ✅ Expensive client objects (embedding model, LLM clients, NLI model, Langfuse client) are singletons, not reconstructed per request — found and fixed a ~4x latency regression from this exact anti-pattern in three separate places.
+- ✅ Reranker candidate pool sized differently depending on whether a real semantic reranker is active (wider) vs. the lexical fallback (narrower, to avoid degrading further).
+
+**Observability**
+- ✅ Structured JSON request tracing (`RequestTrace`) on every request — not just eval runs — covering retrieval/generation latency, cache hit type, citation/groundedness verdicts.
+- ✅ Langfuse traces cross-referenceable to log lines via a deterministic trace ID derived from the request ID.
+- ✅ citation_check/groundedness recorded as first-class Langfuse **scores**, not buried in metadata — directly chartable as production trend lines.
+
+**Engineering hygiene**
+- ✅ Provider abstraction (LLM + embeddings) behind one loader, config-driven, env-override for fast incident response.
+- ✅ Comprehensive, fast, dependency-free test suite (82 tests) using `fakeredis` and mocks to validate real command semantics without live network calls.
+- ✅ Non-root Docker user, CPU-only PyTorch wheel to avoid shipping dead CUDA weight.
+- ✅ Workload Identity Federation for CI/CD — no long-lived GCP service account keys stored in GitHub.

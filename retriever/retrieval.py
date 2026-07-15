@@ -1,13 +1,15 @@
-import json
 import logging
-import math
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Tuple
 
 from dotenv import load_dotenv
 from langchain_core.documents import Document
 
+from retriever.query_rewriter import contextualize_query
+from utils.bm25_index import load_index
 from utils.chroma_utils import create_chroma_store
 from utils.config_loader import load_config
 from utils.model_loader import ModelLoader
@@ -23,7 +25,20 @@ class Retriever:
         self._load_env_variables()
         self.vstore = None
         self.retriever = None
-        self.keyword_index_path = os.path.join(os.getcwd(), self.config.get("ingestion", {}).get("keyword_index_file", "data/.keyword_index.json"))
+        ingestion_cfg = self.config.get("ingestion", {})
+        index_path = os.getenv("INDEX_PATH", ingestion_cfg.get("index_path", "data/landing/_index"))
+        self.bm25_index_uri = f"{index_path.rstrip('/')}/bm25_index.json"
+        self._bm25_index = None
+        self._bm25_loaded_at = 0.0
+        # Reload the persisted BM25 index at most this often -- it's rebuilt
+        # by the ingestion job, not this process, so a short TTL is enough to
+        # pick up new content without re-reading it on every single query.
+        self._bm25_refresh_seconds = int(os.getenv("BM25_REFRESH_SECONDS", "60"))
+
+        self.cohere_api_key = os.getenv("COHERE_API_KEY")
+        self._reranker = None
+        self._rewrite_llm = None
+        self.last_standalone_query = None
 
     def _load_env_variables(self):
         load_dotenv()
@@ -55,7 +70,7 @@ class Retriever:
                     storage_mode=os.getenv("CHROMA_STORAGE_MODE", "auto"),
                 )
             if not self.retriever:
-                top_k = self.config["retriever"]["top_k"] if "retriever" in self.config else 3
+                top_k = self._candidate_pool_top_k()
                 self.retriever = self.vstore.as_retriever(search_kwargs={"k": top_k})
                 logger.info("Retriever loaded successfully with top_k=%s.", top_k)
             return self.retriever
@@ -85,7 +100,7 @@ class Retriever:
             elif operator in {":", "="}:
                 normalized_value = value.lower()
 
-            if normalized_field == "product_rating" and isinstance(normalized_value, (int, float)):
+            if operator in {">=", "<=", ">", "<"} and isinstance(normalized_value, (int, float)):
                 filters[normalized_field] = {operator: normalized_value}
             else:
                 filters[normalized_field] = {"contains": normalized_value}
@@ -195,44 +210,98 @@ class Retriever:
             return 4
         return 5
 
+    def _load_bm25_index(self):
+        now = time.time()
+        if self._bm25_index is None or (now - self._bm25_loaded_at) > self._bm25_refresh_seconds:
+            self._bm25_index = load_index(self.bm25_index_uri)
+            self._bm25_loaded_at = now
+        return self._bm25_index
+
     def keyword_search(self, query: str, top_k: int = 5) -> List[Document]:
-        if not os.path.exists(self.keyword_index_path):
+        bm25_index = self._load_bm25_index()
+        return bm25_index.search(query, top_k=top_k)
+
+    def _load_rewrite_llm(self):
+        if self._rewrite_llm is None:
+            rewrite_model_name = os.getenv(
+                "LLM_REWRITE_MODEL_NAME", self.config.get("llm", {}).get("rewrite_model_name")
+            )
+            self._rewrite_llm = self.model_loader.load_llm(model_name=rewrite_model_name)
+        return self._rewrite_llm
+
+    def _candidate_pool_top_k(self) -> int:
+        """How many dense/BM25 candidates to fetch before merge+rerank.
+        Wider only when Cohere Rerank is actually active -- a real semantic
+        reranker benefits from more candidates, but the crude lexical
+        fallback reranker gets *worse* with a wider pool (more chances for
+        an irrelevant-but-lexically-similar document to outrank the
+        genuinely relevant one), so it keeps the narrow default."""
+        retriever_cfg = self.config.get("retriever", {}) if self.config else {}
+        if self.cohere_api_key:
+            return int(retriever_cfg.get("rerank_candidate_top_k", 20))
+        return int(retriever_cfg.get("top_k", 10))
+
+    def _rerank_with_cohere(self, documents: List[Document], query: str, top_n: int) -> List[Document]:
+        from langchain_cohere import CohereRerank
+
+        retriever_cfg = self.config.get("retriever", {})
+        if self._reranker is None:
+            self._reranker = CohereRerank(
+                cohere_api_key=self.cohere_api_key,
+                model=retriever_cfg.get("rerank_model", "rerank-english-v3.0"),
+                top_n=top_n,
+            )
+        reranked = list(self._reranker.compress_documents(documents=documents, query=query))
+        relevance_floor = retriever_cfg.get("rerank_relevance_floor")
+        if relevance_floor is not None:
+            reranked = [doc for doc in reranked if doc.metadata.get("relevance_score", 1.0) >= relevance_floor]
+        return reranked
+
+    def _rerank(self, documents: List[Document], query: str, filters: Dict[str, Dict[str, Any]]) -> List[Document]:
+        if not documents:
             return []
 
-        with open(self.keyword_index_path, "r", encoding="utf-8") as handle:
-            keyword_index = json.load(handle)
+        top_n = int(self.config.get("retriever", {}).get("rerank_top_k", 5))
 
-        query_tokens = self._tokenize(query)
-        if not query_tokens:
-            return []
+        if self.cohere_api_key:
+            try:
+                return self._rerank_with_cohere(documents, query, top_n)
+            except Exception:
+                logger.exception("Cohere rerank failed; falling back to lexical term-overlap reranking.")
+        else:
+            logger.warning(
+                "COHERE_API_KEY not configured; using lexical term-overlap reranking instead of "
+                "semantic reranking. Set COHERE_API_KEY for production-quality reranking."
+            )
 
-        scored_results = []
-        for doc_id, payload in keyword_index.items():
-            tokens = payload.get("tokens", {})
-            score = sum(tokens.get(token, 0) for token in query_tokens)
-            if score > 0:
-                scored_results.append((score, doc_id, payload))
+        reranked_documents = self.rerank_documents(documents, query, filters)
+        fallback_top_k = self.dynamic_top_k(reranked_documents)
+        return reranked_documents[:fallback_top_k]
 
-        scored_results.sort(reverse=True)
-        results = []
-        for _, _, payload in scored_results[:top_k]:
-            results.append(Document(page_content=payload.get("text", ""), metadata=payload.get("metadata", {})))
-        return results
-
-    def call_retriever(self, query: str) -> List[Document]:
+    def call_retriever(self, query: str, chat_history: str = None) -> List[Document]:
         try:
-            rewritten_query = self.rewrite_query(query)
+            resolved_query = query
+            if chat_history:
+                resolved_query = contextualize_query(query, chat_history, self._load_rewrite_llm)
+            self.last_standalone_query = resolved_query
+
+            rewritten_query = self.rewrite_query(resolved_query)
             filters = self.parse_metadata_filters(query)
             retriever = self.load_retriever()
-            vector_output = retriever.invoke(rewritten_query)
-            vector_output = self.apply_metadata_filters(vector_output, filters)
-            keyword_output = self.keyword_search(rewritten_query, top_k=max(6, len(vector_output) * 2))
-            keyword_output = self.apply_metadata_filters(keyword_output, filters)
+
+            keyword_top_k = max(6, self._candidate_pool_top_k() * 2)
+
+            # Dense and sparse lookups are independent I/O calls -- run them
+            # concurrently instead of sequentially to offset the added
+            # latency from query contextualization and semantic reranking.
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                vector_future = executor.submit(retriever.invoke, rewritten_query)
+                keyword_future = executor.submit(self.keyword_search, rewritten_query, keyword_top_k)
+                vector_output = self.apply_metadata_filters(vector_future.result(), filters)
+                keyword_output = self.apply_metadata_filters(keyword_future.result(), filters)
 
             merged_output = self.rrf_merge(vector_output, keyword_output)
-            reranked_output = self.rerank_documents(merged_output, rewritten_query, filters)
-            top_k = self.dynamic_top_k(reranked_output)
-            return reranked_output[:top_k]
+            return self._rerank(merged_output, rewritten_query, filters)
         except Exception as exc:
             raise RuntimeError("Failed to retrieve relevant documents.") from exc
 
