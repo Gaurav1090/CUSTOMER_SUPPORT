@@ -126,6 +126,7 @@ module "cloud_run_job" {
       INDEX_PATH          = module.storage.index_path
     },
     var.non_secret_env_vars,
+    var.job_only_env_vars,
   )
 
   secret_env_vars = {

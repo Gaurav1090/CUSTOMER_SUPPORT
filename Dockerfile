@@ -16,6 +16,12 @@ COPY static ./static
 COPY templates ./templates
 COPY utils ./utils
 COPY main.py ./
+# Only the demo CSV -- not the rest of data/, which also holds local
+# per-environment ingestion state (.ingestion_state.json,
+# .keyword_index.json) that has no business being baked into the image.
+# Needed for INGEST_LEGACY_CSV=true (used by dev's ingestion job so it
+# has real data to test against instead of an empty landing bucket).
+COPY data/flipkart_product_review.csv ./data/flipkart_product_review.csv
 
 RUN pip install --no-cache-dir --prefer-binary --no-compile -r requirements.txt && \
     # gcsfs: fsspec's gs:// backend, needed by utils/object_store.py for the

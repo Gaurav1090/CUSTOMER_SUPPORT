@@ -52,7 +52,13 @@ variable "artifact_registry_repository_id" {
 }
 
 variable "non_secret_env_vars" {
-  description = "Extra non-secret env vars beyond what this module always sets (ALLOWED_ORIGINS, CHROMA_STORAGE_MODE, LANDING_PATH, INDEX_PATH) -- e.g. LLM_PROVIDER overrides for a given environment."
+  description = "Extra non-secret env vars beyond what this module always sets (ALLOWED_ORIGINS, CHROMA_STORAGE_MODE, LANDING_PATH, INDEX_PATH) -- e.g. LLM_PROVIDER overrides for a given environment. Applied to BOTH the Cloud Run service and the ingestion job."
+  type        = map(string)
+  default     = {}
+}
+
+variable "job_only_env_vars" {
+  description = "Extra non-secret env vars applied ONLY to the ingestion job, not the app Service -- e.g. INGEST_LEGACY_CSV=true, which is meaningless for the running app."
   type        = map(string)
   default     = {}
 }

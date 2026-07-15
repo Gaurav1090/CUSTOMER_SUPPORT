@@ -28,3 +28,15 @@ resource "google_storage_bucket_iam_member" "ingestion_access" {
   role   = "roles/storage.objectAdmin"
   member = "serviceAccount:${var.ingestion_service_account_email}"
 }
+
+# roles/storage.objectAdmin is object-scoped only -- it has zero
+# bucket-level permissions (storage.buckets.get included). gcsfs's
+# makedirs() does a bucket-level existence check before writing, which
+# failed with "Bucket does not exist" (GCS's generic error for a 403,
+# same not-found-instead-of-denied pattern Secret Manager uses) on the
+# first real ingestion run despite the bucket being right there.
+resource "google_storage_bucket_iam_member" "ingestion_bucket_reader" {
+  bucket = google_storage_bucket.ingestion.name
+  role   = "roles/storage.legacyBucketReader"
+  member = "serviceAccount:${var.ingestion_service_account_email}"
+}
