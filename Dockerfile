@@ -17,7 +17,15 @@ COPY templates ./templates
 COPY utils ./utils
 COPY main.py ./
 
-RUN pip install --no-cache-dir --prefer-binary --no-compile -r requirements.txt
+RUN pip install --no-cache-dir --prefer-binary --no-compile -r requirements.txt && \
+    # gcsfs: fsspec's gs:// backend, needed by utils/object_store.py for the
+    # ingestion job's LANDING_PATH/INDEX_PATH once those point at a real GCS
+    # bucket (see infra/modules/gcp/storage) instead of a local folder. Not
+    # in requirements.txt since local dev never touches gs://, but this
+    # image *is* the GCP Cloud Run deployment artifact specifically, so it
+    # always needs it. requirements-optional.txt has the other fsspec
+    # backends (s3fs/adlfs) for if/when a non-GCP build is added.
+    pip install --no-cache-dir --prefer-binary --no-compile gcsfs
 
 RUN mkdir -p /app/chroma_db /app/data && \
     adduser --disabled-password --gecos "" appuser && \
