@@ -3,6 +3,11 @@ resource "google_cloud_run_v2_service" "app" {
   name     = "${var.app_name}-${var.environment}"
   location = var.region
   ingress  = "INGRESS_TRAFFIC_ALL"
+  # The provider defaults this to true, which blocks even a legitimate
+  # destroy-and-replace (e.g. of a tainted revision) without a manual
+  # apply first. Terraform is the sole owner of this resource via CI/CD,
+  # so that protection isn't adding safety here, just friction.
+  deletion_protection = false
 
   template {
     service_account = var.service_account_email

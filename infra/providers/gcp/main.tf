@@ -29,8 +29,12 @@ module "runtime_service_account" {
 module "deployer_service_account" {
   source = "../../modules/gcp/service-account"
 
-  project_id    = var.project_id
-  account_id    = "${var.app_name}-${var.environment}-deploy"
+  project_id = var.project_id
+  # google_service_account.account_id has a 30-char limit -- "-deploy"
+  # pushed "customer-support-rag-<env>-deploy" over it (31-32 chars
+  # depending on environment). "-cd" keeps every environment's SA name
+  # under the limit with room to spare.
+  account_id    = "${var.app_name}-${var.environment}-cd"
   display_name  = "CI/CD deployer SA (${var.environment})"
   project_roles = ["roles/run.admin", "roles/iam.serviceAccountUser"]
 

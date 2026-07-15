@@ -8,6 +8,8 @@ resource "google_cloud_run_v2_job" "ingestion" {
   project  = var.project_id
   name     = "${var.app_name}-${var.environment}-ingestion"
   location = var.region
+  # See cloud-run-service's identical setting for why.
+  deletion_protection = false
 
   template {
     template {
