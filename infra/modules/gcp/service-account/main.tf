@@ -18,7 +18,7 @@ resource "google_project_iam_member" "roles" {
 # every deployer SA's case, so a develop-branch pipeline run can never
 # mint a token usable to deploy prod).
 resource "google_service_account_iam_member" "wif_binding" {
-  count = var.wif_pool_name != null ? 1 : 0
+  count = var.enable_wif_binding ? 1 : 0
 
   service_account_id = google_service_account.this.name
   role               = "roles/iam.workloadIdentityUser"

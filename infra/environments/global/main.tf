@@ -31,8 +31,9 @@ module "builder_service_account" {
   display_name  = "CI image builder SA"
   project_roles = ["roles/artifactregistry.writer"]
 
-  wif_pool_name     = module.wif.pool_name
-  github_repository = var.github_repository
+  enable_wif_binding = true
+  wif_pool_name      = module.wif.pool_name
+  github_repository  = var.github_repository
   # github_ref left null -- any branch's pipeline can build (dev/test/prod
   # all build the same way), only *deploying* is branch-restricted.
 

@@ -17,8 +17,14 @@ variable "project_roles" {
   default     = []
 }
 
+variable "enable_wif_binding" {
+  description = "Whether this SA should be impersonable from CI via WIF -- a static, plan-time decision (true for builder/deployer SAs, false for runtime SAs, which are attached directly to Cloud Run and never impersonated). Deliberately NOT inferred from `wif_pool_name != null`: on a first-ever apply, the WIF pool doesn't exist yet, so its name is unknown at plan time and Terraform can't evaluate a count condition built from it."
+  type        = bool
+  default     = false
+}
+
 variable "wif_pool_name" {
-  description = "Full WIF pool resource name (infra/modules/gcp/wif's pool_name output). Leave null to skip WIF binding entirely (not every SA needs to be impersonable from CI -- runtime SAs are attached directly to Cloud Run, never impersonated)."
+  description = "Full WIF pool resource name (infra/modules/gcp/wif's pool_name output). Only read when enable_wif_binding = true."
   type        = string
   default     = null
 }

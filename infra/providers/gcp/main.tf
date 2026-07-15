@@ -34,9 +34,10 @@ module "deployer_service_account" {
   display_name  = "CI/CD deployer SA (${var.environment})"
   project_roles = ["roles/run.admin", "roles/iam.serviceAccountUser"]
 
-  wif_pool_name     = var.wif_pool_name
-  github_repository = var.github_repository
-  github_ref        = var.github_ref
+  enable_wif_binding = true
+  wif_pool_name      = var.wif_pool_name
+  github_repository  = var.github_repository
+  github_ref         = var.github_ref
 }
 
 module "secrets" {
