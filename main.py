@@ -4,6 +4,7 @@ import os
 import re
 import secrets
 import time
+from typing import Optional
 
 import anyio
 import uvicorn
@@ -25,6 +26,7 @@ from utils.ops import (
     RequestTrace,
     ResponseCache,
     SessionStore,
+    assign_experiment_variant,
     build_langfuse_trace,
     finish_langfuse_trace,
     finish_llm_generation,
@@ -201,9 +203,25 @@ def _embed_query(query: str):
         return None
 
 
+def _ab_test_model_override(variant: str) -> Optional[str]:
+    """The experiment model name when the A/B test is enabled and this
+    request landed in the treatment bucket, None otherwise (use the
+    normally-configured model, i.e. every control-variant and every
+    request when the experiment is off). Opt-in and off by default --
+    AB_TEST_ENABLED must be explicitly set, so this never silently starts
+    spending on a second model."""
+    if variant != "treatment":
+        return None
+    if os.getenv("AB_TEST_ENABLED", "false").strip().lower() != "true":
+        return None
+    return os.getenv("AB_TEST_MODEL_NAME") or None
+
+
 def invoke_chain_details(query: str, session_id: str = "default", request_id: str = None):
     request_id = request_id or new_request_id()
     trace = RequestTrace(request_id=request_id, question=query, session_id=session_id)
+    variant = assign_experiment_variant(session_id)
+    trace.add("experiment_variant", variant)
     langfuse_trace = build_langfuse_trace(trace)
 
     try:
@@ -236,8 +254,13 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         context_text = _build_context_text(retrieved_documents)
         prompt_key = "product_comparison_bot" if is_comparison else "product_bot"
         prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATES[prompt_key])
-        llm = model_loader.load_llm()
-        resolved_model_name = os.getenv("LLM_MODEL_NAME") or model_loader.config["llm"]["model_name"]
+        ab_test_model = _ab_test_model_override(variant)
+        if ab_test_model:
+            llm = model_loader.load_llm(model_name=ab_test_model)
+            resolved_model_name = ab_test_model
+        else:
+            llm = model_loader.load_llm()
+            resolved_model_name = os.getenv("LLM_MODEL_NAME") or model_loader.config["llm"]["model_name"]
 
         chain = prompt | llm
         generation = start_llm_generation(
