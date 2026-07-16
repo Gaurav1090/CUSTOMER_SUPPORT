@@ -7,6 +7,8 @@
     <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.5.0/css/all.css" crossorigin="anonymous">
     <link rel="stylesheet" type="text/css" href="{{ url_for('static', path='style.css') }}">
     <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.3.1/jquery.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.8/dist/purify.min.js"></script>
 </head>
 
 <body>
@@ -97,6 +99,17 @@
             var responseNode = botNode.find(".streaming_response");
             $("#messageFormeight").append(botNode);
 
+            var rawAnswer = "";
+            function renderMarkdown() {
+                // Re-parses the whole accumulated answer on every token --
+                // wasteful in principle, but chat-length text makes this
+                // negligible, and markdown structure (tables, nested lists)
+                // can't be rendered correctly from a partial suffix alone.
+                // DOMPurify sanitizes before injection since this is
+                // LLM-generated content going into innerHTML via .html().
+                responseNode.html(DOMPurify.sanitize(marked.parse(rawAnswer)));
+            }
+
             fetch("/get/stream", {
                 method: "POST",
                 headers: {
@@ -133,7 +146,16 @@
                             }
                         });
                         if (eventName === "token") {
-                            responseNode.text(responseNode.text() + eventData);
+                            // Backend JSON-encodes each token's payload so
+                            // an embedded newline (routine now that answers
+                            // use Markdown headings/lists/tables) survives
+                            // as a real \n instead of breaking SSE framing.
+                            try {
+                                rawAnswer += JSON.parse(eventData);
+                            } catch (e) {
+                                rawAnswer += eventData;
+                            }
+                            renderMarkdown();
                             $("#messageFormeight").scrollTop($("#messageFormeight")[0].scrollHeight);
                         }
                     });
