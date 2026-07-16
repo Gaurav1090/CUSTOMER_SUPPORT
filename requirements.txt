@@ -32,5 +32,14 @@ presidio-analyzer==2.2.363
 # spacy 3.7.0 and 3.8.14 are explicitly excluded by presidio-analyzer's
 # dependency range.
 spacy==3.8.13
+# Langfuse monitoring (utils/ops.py) -- moved here from
+# requirements-optional.txt after that file was found to never actually be
+# installed in the deployed Docker image, silently no-opping every trace
+# (ModuleNotFoundError caught by a broad except) despite the app looking
+# fully wired end to end. Needs >=3: build_langfuse_trace/finish_langfuse_trace
+# use the OpenTelemetry-based span API (start_observation, span.score, ...)
+# introduced in the v3 SDK rewrite; the old v2 `.trace()` call this replaced
+# silently no-opped on any langfuse>=3 install.
+langfuse==4.14.0
 
 -e .
