@@ -73,6 +73,57 @@ body, html {
     box-shadow: 0px 3px 8px rgba(0, 0, 0, 0.1);
     position: relative;
     max-width: 70%;
+    /* Bot answers are rendered Markdown (prompt_library/prompt.py's
+       product_bot template asks for headings/lists/tables) -- a wide table
+       inside this narrow bubble needs to scroll horizontally instead of
+       squeezing every column down to one-word-per-line. */
+    overflow-x: auto;
+}
+
+.msg_cotainer :first-child {
+    margin-top: 0;
+}
+
+.msg_cotainer :last-child {
+    margin-bottom: 0;
+}
+
+.msg_cotainer h1, .msg_cotainer h2, .msg_cotainer h3, .msg_cotainer h4 {
+    margin: 10px 0 6px;
+    font-size: 1.05em;
+    font-weight: 700;
+}
+
+.msg_cotainer p {
+    margin: 6px 0;
+}
+
+.msg_cotainer ul, .msg_cotainer ol {
+    margin: 6px 0;
+    padding-left: 22px;
+}
+
+.msg_cotainer li {
+    margin-bottom: 4px;
+}
+
+.msg_cotainer table {
+    border-collapse: collapse;
+    margin: 8px 0;
+    table-layout: fixed;
+    width: 100%;
+}
+
+.msg_cotainer th, .msg_cotainer td {
+    border: 1px solid rgba(0, 0, 0, 0.15);
+    padding: 6px 10px;
+    text-align: left;
+    vertical-align: top;
+    overflow-wrap: break-word;
+}
+
+.msg_cotainer th {
+    background: rgba(40, 116, 240, 0.08);
 }
 
 .msg_cotainer_send {

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -351,7 +352,16 @@ async def chat_stream(request: Request, msg: str = Form(..., min_length=1, max_l
         )
         yield f"event: cache\ndata: {result['cache_hit']}\n\n"
         for token in result["answer"].split(" "):
-            yield f"event: token\ndata: {token} \n\n"
+            # json.dumps forces the payload onto a single physical line
+            # (embedded newlines become the literal two-char escape \n,
+            # not a real line break) -- SSE requires every physical line of
+            # a "data:" field to carry its own "data:" prefix, which a bare
+            # f"data: {token}" doesn't do for a token containing a real
+            # newline. Markdown answers (headings, lists, tables) routinely
+            # have those now; the naive form silently truncated everything
+            # after the first embedded newline in both this generator and
+            # chat.html's hand-rolled SSE parser.
+            yield f"event: token\ndata: {json.dumps(token + ' ')}\n\n"
         yield "event: done\ndata: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

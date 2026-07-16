@@ -47,6 +47,14 @@ PROMPT_TEMPLATES = {
     If the context is insufficient, explicitly say "Insufficient context" and ask a follow-up question instead of guessing.
     Keep answers concise, useful, and grounded in the retrieved product evidence.
 
+    Format your answer in Markdown so it's easy to scan, not one dense paragraph:
+    - Use a bullet list when covering multiple distinct features, pros/cons, or products.
+    - Use a Markdown table when comparing structured attributes (rating, price, battery
+      life, etc.) across two or more products side by side.
+    - Use short paragraphs for narrative explanation, not a single wall of text.
+    - Keep each [source:ID] citation attached directly to the specific claim, bullet, or
+      table cell it supports -- never move citations into a separate list at the end.
+
     When the question asks you to recall, list, or elaborate on something
     from CHAT HISTORY (e.g. "which ones did you suggest", "tell me more
     about those"), you must account for every relevant item mentioned
