@@ -100,6 +100,7 @@
             $("#messageFormeight").append(botNode);
 
             var rawAnswer = "";
+            var currentRequestId = null;
             function renderMarkdown() {
                 // Re-parses the whole accumulated answer on every token --
                 // wasteful in principle, but chat-length text makes this
@@ -108,6 +109,40 @@
                 // DOMPurify sanitizes before injection since this is
                 // LLM-generated content going into innerHTML via .html().
                 responseNode.html(DOMPurify.sanitize(marked.parse(rawAnswer)));
+            }
+
+            function renderFeedbackButtons(requestId) {
+                if (!requestId) {
+                    return;
+                }
+                var feedbackHtml = `
+                    <div class="feedback_row">
+                        <button type="button" class="feedback_btn feedback_up" title="Helpful"><i class="fas fa-thumbs-up"></i></button>
+                        <button type="button" class="feedback_btn feedback_down" title="Not helpful"><i class="fas fa-thumbs-down"></i></button>
+                    </div>`;
+                var feedbackNode = $($.parseHTML(feedbackHtml));
+                botNode.find(".msg_cotainer").append(feedbackNode);
+
+                feedbackNode.find(".feedback_btn").on("click", function() {
+                    var clicked = $(this);
+                    var rating = clicked.hasClass("feedback_up") ? "up" : "down";
+                    var apiKey = getApiKey();
+                    feedbackNode.find(".feedback_btn").prop("disabled", true);
+                    clicked.addClass("feedback_selected");
+
+                    fetch("/feedback", {
+                        method: "POST",
+                        headers: {
+                            "X-API-Key": apiKey,
+                            "Content-Type": "application/json"
+                        },
+                        body: JSON.stringify({ request_id: requestId, rating: rating })
+                    }).catch(function() {
+                        // Best-effort -- a failed feedback POST shouldn't
+                        // disrupt the chat itself, so this is silently
+                        // swallowed rather than surfaced to the user.
+                    });
+                });
             }
 
             fetch("/get/stream", {
@@ -145,6 +180,9 @@
                                 eventData += line.slice(6);
                             }
                         });
+                        if (eventName === "request_id") {
+                            currentRequestId = eventData;
+                        }
                         if (eventName === "token") {
                             // Backend JSON-encodes each token's payload so
                             // an embedded newline (routine now that answers
@@ -157,6 +195,9 @@
                             }
                             renderMarkdown();
                             $("#messageFormeight").scrollTop($("#messageFormeight")[0].scrollHeight);
+                        }
+                        if (eventName === "done") {
+                            renderFeedbackButtons(currentRequestId);
                         }
                     });
                 }

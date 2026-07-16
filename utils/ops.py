@@ -430,6 +430,36 @@ def start_llm_generation(parent_span, name: str, model: Optional[str], input_dat
         return None
 
 
+def record_feedback_score(request_id: str, rating: str) -> bool:
+    """Record a user thumbs up/down as a score on the original request's
+    Langfuse trace, post-hoc -- by the time feedback arrives the trace's
+    span has already ended, so this uses create_score(trace_id=...)
+    rather than a live span object. trace_id is re-derived deterministically
+    the same way build_langfuse_trace originally derived it
+    (client.create_trace_id(seed=request_id)), so no separate
+    request_id -> trace_id mapping needs to be stored anywhere. Returns
+    False when Langfuse is disabled/unavailable -- same fail-soft pattern
+    as everywhere else in this module; the caller reports that honestly
+    rather than claiming the feedback was recorded when it wasn't."""
+    if not os.getenv("LANGFUSE_PUBLIC_KEY") or not os.getenv("LANGFUSE_SECRET_KEY"):
+        return False
+    try:
+        client = _get_langfuse_client()
+        if client is None:
+            return False
+        trace_id = client.create_trace_id(seed=request_id)
+        client.create_score(
+            name="user_feedback",
+            value=1.0 if rating == "up" else 0.0,
+            trace_id=trace_id,
+            data_type="BOOLEAN",
+        )
+        return True
+    except Exception:
+        logger.exception("Failed to record feedback score for request_id=%s.", request_id)
+        return False
+
+
 def finish_llm_generation(generation, output: Optional[str], usage_metadata: Optional[Dict[str, Any]]) -> None:
     """End a generation observation started by start_llm_generation,
     translating LangChain's usage_metadata keys (input_tokens/output_tokens/
