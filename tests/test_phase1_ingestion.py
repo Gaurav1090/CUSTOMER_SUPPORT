@@ -1,11 +1,53 @@
 import unittest
 
+import pandas as pd
 from langchain_core.documents import Document
 
 from data_ingestion.ingestion_pipeline import DataIngestion
 
 
 class Phase1IngestionTests(unittest.TestCase):
+    def test_documents_from_dataframe_embeds_product_context(self):
+        ingestion = DataIngestion.__new__(DataIngestion)
+        df = pd.DataFrame(
+            [
+                {
+                    "product_title": "Boat Rockerz 235 v2",
+                    "rating": 4,
+                    "summary": "Great bass",
+                    "review": "Sound quality is excellent for the price.",
+                }
+            ]
+        )
+
+        documents = ingestion._documents_from_dataframe(df, "demo.csv", "data/landing/demo.csv")
+
+        self.assertEqual(len(documents), 1)
+        page_content = documents[0].page_content
+        self.assertIn("Boat Rockerz 235 v2", page_content)
+        self.assertIn("Sound quality is excellent for the price.", page_content)
+        # Metadata still carries the structured fields for the rating/price
+        # filters in retriever/retrieval.py -- the fix adds product context
+        # to page_content, it doesn't remove it from metadata.
+        self.assertEqual(documents[0].metadata["product_name"], "Boat Rockerz 235 v2")
+
+    def test_documents_from_dataframe_omits_missing_fields(self):
+        ingestion = DataIngestion.__new__(DataIngestion)
+        df = pd.DataFrame(
+            [
+                {
+                    "product_title": "Generic Earbuds",
+                    "rating": 3,
+                    "summary": None,
+                    "review": "Decent for the price.",
+                }
+            ]
+        )
+
+        documents = ingestion._documents_from_dataframe(df, "demo.csv", "data/landing/demo.csv")
+
+        self.assertNotIn("nan", documents[0].page_content.lower())
+        self.assertNotIn("Summary:", documents[0].page_content)
     def test_chunk_documents_splits_and_preserves_metadata(self):
         ingestion = DataIngestion.__new__(DataIngestion)
         ingestion.config = {"ingestion": {"chunk_size": 120, "chunk_overlap": 20}}
