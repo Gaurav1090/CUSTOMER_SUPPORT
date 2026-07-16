@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from math import sqrt
 from typing import Any, Dict, Iterable, List, Optional
 
+from utils.pii import redact_pii
+
 logger = logging.getLogger(__name__)
 
 
@@ -360,7 +362,7 @@ def build_langfuse_trace(trace: RequestTrace):
             trace_context={"trace_id": trace_id},
             name="rag-chat",
             as_type="span",
-            input={"question": trace.question, "session_id": trace.session_id},
+            input={"question": redact_pii(trace.question), "session_id": trace.session_id},
             metadata={"session_id": trace.session_id},
         )
     except Exception:
@@ -382,7 +384,7 @@ def finish_langfuse_trace(
         return
     try:
         span.update(
-            output={"answer": output} if output is not None else None,
+            output={"answer": redact_pii(output)} if output is not None else None,
             metadata=dict(trace.events),
             level="ERROR" if error else "DEFAULT",
             status_message=error,
@@ -417,7 +419,12 @@ def start_llm_generation(parent_span, name: str, model: Optional[str], input_dat
     if parent_span is None:
         return None
     try:
-        return parent_span.start_observation(name=name, as_type="generation", model=model, input=input_data)
+        redacted_input = (
+            {key: redact_pii(value) if isinstance(value, str) else value for key, value in input_data.items()}
+            if isinstance(input_data, dict)
+            else redact_pii(input_data) if isinstance(input_data, str) else input_data
+        )
+        return parent_span.start_observation(name=name, as_type="generation", model=model, input=redacted_input)
     except Exception:
         logger.exception("Failed to start Langfuse generation observation: %s", name)
         return None
@@ -438,7 +445,7 @@ def finish_llm_generation(generation, output: Optional[str], usage_metadata: Opt
                 "output": usage_metadata.get("output_tokens"),
                 "total": usage_metadata.get("total_tokens"),
             }
-        generation.update(output=output, usage_details=usage_details)
+        generation.update(output=redact_pii(output), usage_details=usage_details)
         generation.end()
     except Exception:
         logger.exception("Failed to finalize Langfuse generation observation.")

@@ -29,6 +29,7 @@ from utils.ops import (
     new_request_id,
     start_llm_generation,
 )
+from utils.pii import redact_pii
 
 from prompt_library.prompt import PROMPT_TEMPLATES
 
@@ -224,7 +225,7 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         retrieval_start = time.time()
         retrieved_documents = retriever_obj.call_retriever(query, chat_history=chat_history, langfuse_span=langfuse_trace)
         trace.add("retrieval_latency_ms", int((time.time() - retrieval_start) * 1000))
-        trace.add("standalone_query", retriever_obj.last_standalone_query)
+        trace.add("standalone_query", redact_pii(retriever_obj.last_standalone_query))
         trace.add("retrieved_source_ids", _source_ids(retrieved_documents))
 
         context_text = _build_context_text(retrieved_documents)
