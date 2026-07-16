@@ -35,6 +35,7 @@ from utils.ops import (
     start_llm_generation,
 )
 from utils.pii import redact_pii
+from utils.prompt_guard import detect_prompt_injection
 
 from prompt_library.prompt import PROMPT_TEMPLATES
 
@@ -46,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 INSUFFICIENT_CONTEXT_NO_DOCS = "Insufficient context. Please provide more details about the product or issue."
 INSUFFICIENT_CONTEXT_UNGROUNDED = "Insufficient context. I cannot confidently answer from the retrieved evidence alone."
+PROMPT_INJECTION_BLOCKED = "I can't process that request. Please ask a genuine product question."
 
 load_dotenv()
 
@@ -225,6 +227,18 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
     langfuse_trace = build_langfuse_trace(trace)
 
     try:
+        injection_technique = detect_prompt_injection(query)
+        if injection_technique:
+            trace.add("prompt_injection_technique", injection_technique)
+            trace.finish("blocked")
+            finish_langfuse_trace(langfuse_trace, trace, output=PROMPT_INJECTION_BLOCKED)
+            return {
+                "answer": PROMPT_INJECTION_BLOCKED,
+                "cache_hit": "blocked",
+                "retrieved_documents": [],
+                "request_id": request_id,
+            }
+
         query_embedding = _embed_query(query)
         cached = response_cache.get_exact(query, session_id)
         if not cached and query_embedding:
