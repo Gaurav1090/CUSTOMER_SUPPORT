@@ -3,7 +3,7 @@ import unittest
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 
-from retriever.query_rewriter import contextualize_query
+from retriever.query_rewriter import classify_comparison_products, contextualize_query
 
 
 class ContextualizeQueryTests(unittest.TestCase):
@@ -66,6 +66,61 @@ class ContextualizeQueryTests(unittest.TestCase):
         result = contextualize_query("", "some history", load_llm)
 
         self.assertEqual(result, "")
+
+
+class ClassifyComparisonProductsTests(unittest.TestCase):
+    def test_extracts_two_products_from_product_lines(self):
+        fake_llm = RunnableLambda(
+            lambda prompt_value: AIMessage(content="PRODUCT: Boat Rockerz 235v2\nPRODUCT: OnePlus Bullets Wireless Z")
+        )
+
+        result = classify_comparison_products(
+            "How does the Boat Rockerz 235v2 compare to the OnePlus Bullets Wireless Z?", lambda: fake_llm
+        )
+
+        self.assertEqual(result, ["Boat Rockerz 235v2", "OnePlus Bullets Wireless Z"])
+
+    def test_returns_none_for_single_product_question(self):
+        fake_llm = RunnableLambda(lambda prompt_value: AIMessage(content="NONE"))
+
+        result = classify_comparison_products("How is the Boat Rockerz 235v2?", lambda: fake_llm)
+
+        self.assertIsNone(result)
+
+    def test_returns_none_when_only_one_product_line_extracted(self):
+        """A single PRODUCT: line isn't a comparison -- guards against a
+        model partially following the format without actually naming two
+        distinct products."""
+        fake_llm = RunnableLambda(lambda prompt_value: AIMessage(content="PRODUCT: Boat Rockerz 235v2"))
+
+        result = classify_comparison_products("How is the Boat Rockerz 235v2?", lambda: fake_llm)
+
+        self.assertIsNone(result)
+
+    def test_returns_none_on_invoke_failure(self):
+        def _boom(_prompt_value):
+            raise RuntimeError("groq is down")
+
+        result = classify_comparison_products("compare A and B", lambda: RunnableLambda(_boom))
+
+        self.assertIsNone(result)
+
+    def test_returns_none_on_load_llm_failure(self):
+        def load_llm():
+            raise RuntimeError("Missing environment variables: ['GROQ_API_KEY']")
+
+        result = classify_comparison_products("compare A and B", load_llm)
+
+        self.assertIsNone(result)
+
+    def test_empty_question_returns_none_without_llm_call(self):
+        calls = []
+        load_llm = lambda: calls.append("loaded") or RunnableLambda(lambda prompt_value: AIMessage(content="NONE"))
+
+        result = classify_comparison_products("", load_llm)
+
+        self.assertIsNone(result)
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
