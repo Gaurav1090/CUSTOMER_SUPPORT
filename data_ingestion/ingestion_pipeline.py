@@ -15,7 +15,7 @@ from utils.bm25_index import upsert_index
 from utils.chroma_utils import create_chroma_store
 from utils.config_loader import load_config
 from utils.model_loader import ModelLoader
-from utils.object_store import ensure_dir, file_fingerprint, list_files, read_bytes, read_json, write_json
+from utils.object_store import ensure_dir, file_fingerprint, list_files, move_file, read_bytes, read_json, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,7 @@ class DataIngestion:
         ingestion_cfg = self.config.get("ingestion", {})
         self.landing_path = os.getenv("LANDING_PATH", ingestion_cfg.get("landing_path", "data/landing"))
         self.index_path = os.getenv("INDEX_PATH", ingestion_cfg.get("index_path", "data/landing/_index"))
+        self.archive_path = os.getenv("ARCHIVE_PATH", ingestion_cfg.get("archive_path", "data/landing/_archive"))
         self.supported_extensions = tuple(ingestion_cfg.get("supported_extensions", [".pdf"]))
         self.chunk_size = int(ingestion_cfg.get("chunk_size", 400))
         self.chunk_overlap = int(ingestion_cfg.get("chunk_overlap", 80))
@@ -63,6 +64,7 @@ class DataIngestion:
         self.bm25_index_uri = f"{self.index_path.rstrip('/')}/bm25_index.json"
 
         ensure_dir(self.landing_path)
+        ensure_dir(self.archive_path)
         logger.info("Ingestion landing path: %s", self.landing_path)
 
     def _load_env_variables(self):
@@ -339,6 +341,27 @@ class DataIngestion:
         logger.info("Inserted %d new chunks into the vector store and BM25 index.", len(inserted_ids))
         return inserted_ids
 
+    # ------------------------------------------------------------- archive
+
+    def _archive_files(self, uris: List[str]) -> None:
+        """Move successfully-ingested landing files to the archive prefix
+        so landing/ only ever holds files not yet processed -- the
+        standard landing -> processed -> archive pattern, instead of
+        ingested files sitting in landing/ indefinitely. Best-effort: the
+        vector store is already the source of truth for what's ingested by
+        this point (state was saved before this runs), so a failed move
+        just leaves that file behind in landing/ -- harmless, since its
+        fingerprint is already recorded as processed and it won't be
+        re-ingested next run either way."""
+        for uri in uris:
+            filename = uri.rsplit("/", 1)[-1]
+            dest_uri = f"{self.archive_path.rstrip('/')}/{filename}"
+            try:
+                move_file(uri, dest_uri)
+                logger.info("Archived %s -> %s", uri, dest_uri)
+            except Exception:
+                logger.exception("Failed to archive %s; leaving it in landing.", uri)
+
     # ------------------------------------------------------------- driver
 
     def run_pipeline(self, include_legacy_csv: bool = False):
@@ -363,6 +386,8 @@ class DataIngestion:
         for uri in new_files:
             state.setdefault("processed_files", {})[uri] = file_fingerprint(uri)
         self._save_state(state)
+
+        self._archive_files(new_files)
 
 
 if __name__ == "__main__":

@@ -24,11 +24,8 @@ module "app" {
   wif_pool_name                   = data.terraform_remote_state.global.outputs.wif_pool_name
   artifact_registry_repository_id = data.terraform_remote_state.global.outputs.artifact_registry_repository_id
 
-  # Dev's landing bucket starts empty -- no one uploads real source files
-  # to a throwaway dev environment. Ingest the demo dataset baked into the
-  # image instead, so dev actually has real data to test the deployed app
-  # against, matching what local dev has always used.
-  job_only_env_vars = {
-    INGEST_LEGACY_CSV = "true"
-  }
+  # Session/cache/rate-limit state needs to survive across dev's up-to-2
+  # Cloud Run instances -- provisions Memorystore + the VPC connector to
+  # reach it. See infra/modules/gcp/networking.
+  enable_vpc_connector = true
 }

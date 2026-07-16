@@ -21,6 +21,11 @@ ingestion:
   # landing path, so a fresh ingestion job container has no local state to
   # lose.
   index_path: "data/landing/_index"
+  # Where successfully-ingested landing files get moved to after a run --
+  # landing -> processed -> archive, so landing/ only ever holds files not
+  # yet ingested. Same storage backend as landing_path; override with the
+  # ARCHIVE_PATH env var.
+  archive_path: "data/landing/_archive"
   supported_extensions: [".pdf", ".csv"]
   # Legacy CSV path, kept for the bundled demo dataset / tests only.
   legacy_csv_path: "data/flipkart_product_review.csv"

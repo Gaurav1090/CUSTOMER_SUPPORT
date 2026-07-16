@@ -12,6 +12,7 @@ locals {
     COHERE_API_KEY      = "cohere-api-key"
     LANGFUSE_PUBLIC_KEY = "langfuse-public-key"
     LANGFUSE_SECRET_KEY = "langfuse-secret-key"
+    REDIS_URL           = "redis-url"
   }
 }
 
@@ -124,6 +125,7 @@ module "cloud_run_job" {
       CHROMA_STORAGE_MODE = "cloud"
       LANDING_PATH        = module.storage.landing_path
       INDEX_PATH          = module.storage.index_path
+      ARCHIVE_PATH        = module.storage.archive_path
     },
     var.non_secret_env_vars,
     var.job_only_env_vars,

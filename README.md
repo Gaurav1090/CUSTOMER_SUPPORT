@@ -350,8 +350,95 @@ location -- can point at `gs://`/`s3://`/`abfs://` in prod).
 
 ## Deployment
 
-`Dockerfile`, `docker-compose.yml`, and `deploy/k8s.yaml` (GKE, with
-Workload Identity Federation wiring in `.github/workflows/deploy-to-gke.yml`)
-are present but out of scope for this document. `docker-compose.yml`
-deliberately has no local Redis service -- `REDIS_URL` is expected to point
-at a real managed Redis in that context.
+Deployed on **Google Cloud Run** (migrated 2026-07-15 from an earlier GKE-based setup --
+`git log` still has `deploy/k8s.yaml` if you need to compare). Full module/environment
+layout and how to add a second cloud provider live in [`infra/README.md`](infra/README.md);
+this section is the practical summary.
+
+`docker-compose.yml` deliberately has no local Redis service -- `REDIS_URL` is expected
+to point at a real managed Redis even in that context.
+
+### Environments
+
+| Environment | Deploys from | Terraform root | Status |
+|---|---|---|---|
+| dev  | `developer` branch | `infra/environments/dev`  | **Live**, verified end-to-end 2026-07-16 |
+| test | `staging` branch   | `infra/environments/test` | Not yet applied |
+| prod | `main` branch      | `infra/environments/prod` | Not yet applied |
+
+Each environment is fully isolated: its own Terraform state prefix, its own deployer +
+runtime service accounts (least-privilege, branch-scoped via Workload Identity
+Federation so a `developer`-branch CI run can never deploy `prod`), its own Cloud Run
+service + ingestion job, Secret Manager secrets, and GCS bucket for ingestion
+landing/index storage.
+
+### CI/CD
+
+- `ci-fast-tests.yml` -- the 82-test unit suite, every push/PR, no live API calls.
+- `cd-dev.yml` / `cd-test.yml` / `cd-prod.yml` -- branch-triggered: tests -> build (once;
+  the same image is promoted across environments, never rebuilt per environment) ->
+  deploy (runs the ingestion job, then the Cloud Run service, then a `/health`+`/ready`
+  smoke test).
+- `rag-evaluation.yml` -- the quota-heavy live-provider evaluation. Only runs before a
+  prod deploy or on manual `workflow_dispatch`, deliberately off the routine path so it
+  doesn't burn Groq/Chroma/Cohere quota on every commit.
+
+### Standing up a new environment
+
+```bash
+cd infra/environments/<env>
+terraform init && terraform plan   # review before applying -- creates real billed resources
+terraform apply
+
+# Populate secrets (Terraform only creates the containers, never values):
+echo -n "$VALUE" | gcloud secrets versions add customer-support-rag-<env>-app-api-key \
+  --project=<project-id> --data-file=-
+# repeat for groq-api-key, chroma-api-key, chroma-tenant, chroma-database, etc.
+```
+
+Then create the matching GitHub Environment (repo Settings -> Environments) with
+`GCP_WIF_PROVIDER`, `GCP_DEPLOYER_SA_EMAIL`, `GCP_REGION`, `GCP_PROJECT_ID`,
+`CLOUD_RUN_SERVICE_NAME`, `CLOUD_RUN_JOB_NAME` as variables, plus the repo-level
+`GCP_WIF_PROVIDER`/`GCP_BUILDER_SA_EMAIL`/`GCP_REGION`/`GCP_PROJECT_ID`/
+`GCP_ARTIFACT_REPOSITORY_ID` the build step needs (see
+`.github/workflows/_reusable-build.yml`/`_reusable-deploy.yml` for exactly which ones).
+
+### Real bugs hit standing up `dev` (worth knowing before repeating this for test/prod)
+
+Every one of these was an actual failure on the first real deploy, not a hypothetical:
+
+- An unquoted YAML description mixing `"quotes"` and `{braces}` got the *entire*
+  workflow file silently rejected by GitHub with zero jobs created -- no job-level
+  error to debug from, since nothing ran at all.
+- Reusable workflow jobs only get the permissions the *caller* explicitly grants
+  (`id-token: write` for WIF auth here) -- declaring them in the reusable file alone
+  isn't enough.
+- A local composite action (`./.github/actions/gcp-auth`) needs `actions/checkout` in
+  the same job first, or it can't find its own `action.yml`.
+- The deployer service account needs `roles/artifactregistry.reader` alongside
+  `roles/run.admin` -- otherwise it can push an image it then can't pull back down.
+- `roles/storage.objectAdmin` on a GCS bucket grants **zero** bucket-level permissions
+  (object-level only) -- `gcsfs`'s existence check needs `roles/storage.legacyBucketReader`
+  too, or it fails with a misleading "bucket does not exist" even though it's right there.
+- `google_service_account.account_id` has a 30-character limit and GCS bucket names have
+  a 63-character limit -- naive `${app_name}-${environment}-<suffix>` naming hit both.
+- Cloud Run's `deletion_protection` defaults to `true` and blocks even a legitimate
+  destroy-and-replace of a tainted resource within the same apply -- set explicitly to
+  `false`, since Terraform is the sole owner of these resources here.
+- Behind Cloud Run's TLS-terminating proxy, `uvicorn` needs `--proxy-headers
+  --forwarded-allow-ips='*'`, or `url_for()`-generated URLs come back `http://` on an
+  `https://` page -- browsers block that as mixed content, breaking the chat UI's own
+  stylesheet while external CDN assets kept loading fine.
+
+### Verified live
+
+```bash
+$ curl https://customer-support-rag-dev-udytqlhsma-uw.a.run.app/health
+{"status":"healthy"}
+$ curl https://customer-support-rag-dev-udytqlhsma-uw.a.run.app/ready
+{"status":"ready","checks":{"app_api_key":true,"groq_api_key":true,"chroma_storage":true}}
+```
+
+Real ingestion ran end to end (542 chunks from the bundled demo dataset into Chroma
+Cloud + the BM25 index), and a real query through the deployed app returned a
+correctly-grounded, cited answer -- not just health checks passing.

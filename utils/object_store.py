@@ -85,6 +85,22 @@ def write_json(uri: str, payload: Any) -> None:
         json.dump(payload, handle, indent=2)
 
 
+def move_file(src_uri: str, dest_uri: str) -> None:
+    """Move a file from src_uri to dest_uri (creating dest's parent prefix
+    first). Used to relocate a landing file to the archive prefix after
+    it's been successfully ingested, so landing/ only ever holds files not
+    yet processed -- the standard landing -> processed -> archive pattern."""
+    fs, src_path = get_fs(src_uri)
+    _, dest_path = get_fs(dest_uri)
+    dest_parent = dest_path.rsplit("/", 1)[0] if "/" in dest_path else ""
+    if dest_parent:
+        try:
+            fs.makedirs(dest_parent, exist_ok=True)
+        except NotImplementedError:
+            pass
+    fs.mv(src_path, dest_path)
+
+
 def file_fingerprint(uri: str) -> str:
     """A cheap, storage-agnostic change signal for a file: size + mtime if
     available, falling back to just the path. Good enough to decide whether

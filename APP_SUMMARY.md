@@ -393,6 +393,33 @@ Cost profile: zero API/monetary cost (runs locally, same as embeddings), ~500MB-
   - CI/CD (`.github/workflows/cd-{dev,test,prod}.yml`) is branch-triggered and split so the fast, quota-free 82-test unit suite (`ci-fast-tests.yml`) runs on every push/PR, while the quota-heavy live-provider evaluation (`rag-evaluation.yml`) only runs before a prod deploy or on manual dispatch.
 - **Prior GKE deployment (removed)**: an earlier setup deployed to a GKE cluster via `deploy/k8s.yaml` and `.github/workflows/deploy-to-gke.yml`. That cluster was found broken during 2026-07-14 testing (a CSI Secrets Store driver name mismatch caused the app pods to silently fail to start for 3+ days while still billing) and was torn down, along with an associated Memorystore Redis instance and orphaned networking resources. All of it — the K8s manifest, the GKE-specific Terraform, and the old CI workflow — has since been deleted and replaced by the Cloud Run setup above; local testing that day used a temporary Docker Redis container instead of the (now-deleted) managed instance.
 
+### 12.1 `dev` is live (2026-07-16)
+
+`infra/environments/dev` is fully applied and verified end to end — not just `terraform validate`-clean. Confirmed live:
+
+```
+$ curl https://customer-support-rag-dev-udytqlhsma-uw.a.run.app/ready
+{"status":"ready","checks":{"app_api_key":true,"groq_api_key":true,"chroma_storage":true}}
+```
+
+The ingestion job ran for real (542 chunks from the bundled demo dataset embedded into Chroma Cloud + the BM25 index), and a real query through the deployed app (`/get`) returned a correctly-grounded, cited answer — the full pipeline working on Cloud Run, not just health checks passing. `test`/`prod` are not yet applied.
+
+Cost note: `min_instance_count = 0` for dev, so it scales to zero when idle — leaving it running costs ~$0/day unless actively receiving traffic (Cloud Run bills per-second of request processing, not per-second of existence). This is a direct, deliberate contrast with the old GKE cluster, which billed continuously for 3+ days while silently broken.
+
+**Real bugs found getting `dev` live** — every one hit on the actual first deploy, not hypothetical, worth knowing before applying `test`/`prod`:
+
+1. An unquoted YAML description mixing `"quotes"` and `{braces}` in `_reusable-deploy.yml` got the *entire* workflow file silently rejected by GitHub — zero jobs created, no job-level error to debug from. Found via `actionlint` (a GitHub-Actions-aware linter, installed specifically because generic YAML validation doesn't catch this class of error) plus fetching the actual Actions run page (the specific rejection reason isn't exposed via the REST API at all).
+2. Reusable workflow jobs only get the permissions the *caller* explicitly grants (`permissions: id-token: write` for WIF auth) — declaring them inside the reusable workflow file alone isn't sufficient. Silent zero-jobs rejection again until fixed.
+3. A local composite action (`./.github/actions/gcp-auth`) needs `actions/checkout` in the same job first, or the runner can't find its own `action.yml` on disk.
+4. The deployer service account needs `roles/artifactregistry.reader` alongside `roles/run.admin` + `roles/iam.serviceAccountUser` — without it, `gcloud run deploy` can push an image and then immediately fail to pull it back down (`PERMISSION_DENIED: artifactregistry.repositories.downloadArtifacts`).
+5. `roles/storage.objectAdmin` on a GCS bucket grants **zero** bucket-level permissions (object-level CRUD only) — `gcsfs`'s existence check (`fs.makedirs`) needs `roles/storage.legacyBucketReader` too, or it fails with `FileNotFoundError: Bucket does not exist` even though the bucket is right there. Same not-found-instead-of-denied error shape Secret Manager showed for a permission gap earlier in the week.
+6. `google_service_account.account_id` has a hard 30-character limit, and GCS bucket names have a 63-character limit — naive `${app_name}-${environment}-<suffix>` naming (with `app_name = "customer-support-rag"`, 21 characters) blew past both. Shortened the deployer SA suffix (`-deploy` → `-cd`) and dropped the redundant `app_name` from the bucket name (`project_id` alone already guarantees global uniqueness).
+7. Cloud Run's `deletion_protection` defaults to `true` and blocks even a legitimate destroy-and-replace of a tainted resource *within the same apply* — the check runs against the resource's prior state, not the updated config, so setting `deletion_protection = false` and replacing in one apply doesn't work; had to `terraform untaint` first (or, when that also failed, delete the broken resource directly). Set explicitly to `false` going forward since Terraform is the sole owner here.
+8. `INGEST_LEGACY_CSV=true` silently ingested nothing — `_load_legacy_csv_documents()` checks `os.path.exists()` and returns `[]` if missing, no error. Assumed the demo CSV was "already baked into the image" without verifying; the Dockerfile never copied `data/` at all. Added a targeted `COPY data/flipkart_product_review.csv` (not the whole `data/` dir, which also holds local per-environment ingestion state that shouldn't be baked into a shared image).
+9. Behind Cloud Run's TLS-terminating proxy, `uvicorn` needs `--proxy-headers --forwarded-allow-ips='*'`, or `url_for()`-generated URLs come back `http://` on an `https://` page — browsers block that as mixed content. Broke the chat UI's own `style.css` (Starlette-generated URL) while external CDN assets (Bootstrap/FontAwesome, already hardcoded `https://`) kept loading fine — the app looked "distorted": raw Bootstrap structure, none of the app's own styling.
+
+All fixed and verified via the same tight loop each time: push → PR → CI green → merge → watch the real Cloud Run/GitHub Actions logs → diagnose the *actual* error (not a guess) → fix → repeat. Two required explicit human sign-off before applying (an IAM role grant, and a Terraform apply) per the project's standing "confirm before consequential infra changes" practice.
+
 ---
 
 ## 13. Recent hardening (2026-07-14)
@@ -415,7 +442,7 @@ All changes are covered by the existing 82-test suite (all passing) plus 3 new/u
 - **Multi-item retrieval dilution** (found 2026-07-14, parked). Once a follow-up correctly expands to "tell me more about X, Y, and Z," a single combined retrieval query dilutes precision per item — the embedding for "X and Y and Z" retrieves well for whichever product dominates semantically, weakly for the others. The system's own citation/groundedness guardrails correctly refuse to fabricate on the under-retrieved items (safe failure mode) rather than hallucinate, but the answer is incomplete. A real fix means running a separate retrieval pass per named item and merging contexts — genuine architecture work, not a prompt tweak.
 - **The web UI has no per-browser session ID.** `templates/chat.html` never sends `X-Session-Id`, so every browser tab defaults to `session_id="default"` server-side — concurrent web UI users currently share one global conversation. The API-level session isolation works correctly; the UI just doesn't exercise it.
 - **Metadata filters for `price`/`category`/`brand` don't match anything** against the bundled demo dataset (the CSV only has `product_title`/`rating`/`summary`/`review`). `rating>=N` does work. This means the LLM occasionally answers from tangentially-related context on out-of-scope filter questions instead of refusing — correct grounded behavior given what's actually available, just not what a filter query implies.
-- **Cloud Run infrastructure is written but not yet applied.** `infra/` (see §12) validates cleanly (`terraform validate` passes for every module/provider/environment) but `terraform apply` has not been run — no Cloud Run services/jobs/secrets exist in GCP yet, and no Redis instance has been reprovisioned. Applying, populating Secret Manager values, and a first end-to-end deploy are the next steps.
+- **`test`/`prod` Cloud Run environments are written but not yet applied.** `dev` is live and verified (see §12.1) — `terraform validate`/`apply` both work cleanly for `test`/`prod` too (same module code, now bug-fixed), but neither has been applied yet, and their GitHub Environment variables aren't configured. No Redis instance has been reprovisioned for any environment (see the `networking` module note in §12/`infra/README.md`).
 
 ---
 

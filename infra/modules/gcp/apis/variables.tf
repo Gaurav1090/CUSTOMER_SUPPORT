@@ -14,9 +14,14 @@ variable "services" {
     "iamcredentials.googleapis.com",
     "sts.googleapis.com",
     "secretmanager.googleapis.com",
-    # Not used yet (no Redis instance exists after the 2026-07 cleanup) --
-    # kept enabled so re-provisioning Memorystore later needs no API
-    # activation step, only new resources in infra/modules/gcp/networking.
     "redis.googleapis.com",
+    # Needed for the private services VPC peering Memorystore requires
+    # (google_service_networking_connection in infra/modules/gcp/networking).
+    "servicenetworking.googleapis.com",
+    # Needed by google_vpc_access_connector itself -- missed on the first
+    # pass, which let the connector resource fail with a 403 SERVICE_DISABLED
+    # after the Redis instance had already been created (see the dev apply
+    # from this same rollout).
+    "vpcaccess.googleapis.com",
   ]
 }
