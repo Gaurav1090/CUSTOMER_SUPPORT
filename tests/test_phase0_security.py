@@ -63,9 +63,16 @@ class Phase0SecurityTests(unittest.TestCase):
     def test_genuine_product_question_is_not_blocked_by_injection_guard(self):
         """Regression guard: the injection check must not itself become a
         false-positive source that blocks real questions before they ever
-        reach retrieval."""
+        reach retrieval. Only call_retriever is mocked -- what happens
+        after (a real LLM call) isn't under test here and needs no live
+        provider credentials, which CI's fast-test suite deliberately
+        doesn't have; any downstream failure is expected and irrelevant to
+        what this test asserts."""
         with patch.object(main.retriever_obj, "call_retriever", return_value=[]) as mock_retrieve:
-            main.invoke_chain_details("What is the battery life of the Boat Rockerz 235v2?", session_id="injection-test-2")
+            try:
+                main.invoke_chain_details("What is the battery life of the Boat Rockerz 235v2?", session_id="injection-test-2")
+            except Exception:
+                pass
 
         mock_retrieve.assert_called_once()
 
