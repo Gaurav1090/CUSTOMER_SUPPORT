@@ -1,6 +1,24 @@
 import unittest
 
-from utils.ops import RequestTrace, build_langfuse_trace, finish_langfuse_trace
+from utils.ops import (
+    RequestTrace,
+    build_langfuse_trace,
+    finish_langfuse_trace,
+    finish_llm_generation,
+    start_llm_generation,
+)
+
+
+class _FakeGeneration:
+    def __init__(self):
+        self.update_calls = []
+        self.ended = False
+
+    def update(self, **kwargs):
+        self.update_calls.append(kwargs)
+
+    def end(self):
+        self.ended = True
 
 
 class _FakeSpan:
@@ -12,6 +30,7 @@ class _FakeSpan:
         self.update_calls = []
         self.score_calls = []
         self.ended = False
+        self.started_observations = []
 
     def update(self, **kwargs):
         self.update_calls.append(kwargs)
@@ -21,6 +40,10 @@ class _FakeSpan:
 
     def end(self):
         self.ended = True
+
+    def start_observation(self, **kwargs):
+        self.started_observations.append(kwargs)
+        return _FakeGeneration()
 
 
 class BuildLangfuseTraceTests(unittest.TestCase):
@@ -99,6 +122,60 @@ class FinishLangfuseTraceTests(unittest.TestCase):
         # Must not raise -- an observability backend hiccup must never
         # break the actual user-facing response.
         finish_langfuse_trace(_BrokenSpan(), self.trace, output="answer")
+
+
+class LlmGenerationTrackingTests(unittest.TestCase):
+    def test_start_returns_none_when_parent_span_is_none(self):
+        self.assertIsNone(start_llm_generation(None, "answer_generation", "llama-3.3-70b"))
+
+    def test_finish_is_noop_when_generation_is_none(self):
+        # Must not raise -- this is the disabled/unconfigured path every
+        # request takes by default.
+        finish_llm_generation(None, "output text", {"input_tokens": 10, "output_tokens": 5})
+
+    def test_start_creates_nested_generation_observation_with_model(self):
+        span = _FakeSpan()
+
+        start_llm_generation(span, "answer_generation", "llama-3.3-70b", input_data={"question": "q"})
+
+        self.assertEqual(len(span.started_observations), 1)
+        call = span.started_observations[0]
+        self.assertEqual(call["as_type"], "generation")
+        self.assertEqual(call["model"], "llama-3.3-70b")
+        self.assertEqual(call["name"], "answer_generation")
+
+    def test_finish_translates_langchain_usage_keys_to_langfuse_schema(self):
+        generation = _FakeGeneration()
+
+        finish_llm_generation(
+            generation, "the answer", {"input_tokens": 120, "output_tokens": 40, "total_tokens": 160}
+        )
+
+        self.assertEqual(len(generation.update_calls), 1)
+        usage = generation.update_calls[0]["usage_details"]
+        self.assertEqual(usage, {"input": 120, "output": 40, "total": 160})
+        self.assertEqual(generation.update_calls[0]["output"], "the answer")
+        self.assertTrue(generation.ended)
+
+    def test_finish_handles_missing_usage_metadata(self):
+        """Not every provider populates usage_metadata (e.g. some
+        HuggingFace router responses) -- must record the output without
+        usage_details rather than raising."""
+        generation = _FakeGeneration()
+
+        finish_llm_generation(generation, "the answer", None)
+
+        self.assertIsNone(generation.update_calls[0]["usage_details"])
+        self.assertTrue(generation.ended)
+
+    def test_finish_swallows_exceptions_from_the_generation_itself(self):
+        class _BrokenGeneration(_FakeGeneration):
+            def update(self, **kwargs):
+                raise RuntimeError("langfuse is down")
+
+        # Must not raise -- an observability backend hiccup must never
+        # break the actual LLM call it's wrapping.
+        finish_llm_generation(_BrokenGeneration(), "answer", {"input_tokens": 1})
 
 
 if __name__ == "__main__":
