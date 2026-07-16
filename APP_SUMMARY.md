@@ -2,19 +2,23 @@
 
 Single source of truth for this codebase: what it is, how a request flows through it end to end, every API surface, every config knob, and the reasoning behind the non-obvious decisions. Written to let someone with zero prior context become productive without re-deriving anything from the source.
 
-Last updated: 2026-07-14, reflecting the state after a full day of live testing, bug fixes, and a latency hardening pass (see [Recent Hardening](#recent-hardening-2026-07-14) at the bottom).
+Last updated: 2026-07-16, after a full architecture-critique-driven hardening pass covering Redis/ingestion infra, retrieval quality, security/compliance, observability/cost, and product-outcome measurement — see [§20 Recent hardening](#20-recent-hardening-2026-07-16) for the complete list of what changed and why, and [§21 Known limitations / not accomplished](#21-known-limitations--not-accomplished) for what was deliberately left undone.
 
 ---
 
 ## 1. What this is
 
-A FastAPI-based e-commerce product-support chatbot. It answers questions about products using **retrieval-augmented generation (RAG)** over a corpus of product reviews (currently: 450 Flipkart reviews, ~542 chunks). It is not a general chatbot — it refuses to answer anything it cannot ground in retrieved evidence, on purpose.
+A FastAPI-based e-commerce product-support chatbot. It answers questions about products using **retrieval-augmented generation (RAG)** over a corpus of product reviews (currently: the bundled Flipkart review dataset, ~576 chunks after the product-context embedding fix in §20). It is not a general chatbot — it refuses to answer anything it cannot ground in retrieved evidence, on purpose.
 
 Core design commitments, all visible directly in the code:
 
 - **Grounded or silent.** Every factual claim must carry a `[source:ID]` citation. An answer that cites something it didn't retrieve, or that an LLM judge decides isn't actually supported by the context, gets replaced with a safe refusal — never a guess.
 - **Multi-turn aware.** Follow-up questions ("what about a cheaper one?") get rewritten into standalone questions using recent chat history before retrieval runs.
+- **Multi-product aware.** A comparison question ("compare A's battery life to B's") is detected and retrieves each named product separately, instead of one query embedding that only ever favors whichever product's phrasing is closer.
 - **Provider-agnostic.** LLM provider (Groq / Google Gemini / HuggingFace) and embedding provider are both swappable via config, with env-var overrides for the LLM side so you can hop providers mid-incident without a redeploy.
+- **Defended on both prompt-injection channels.** Retrieved review content is delimited and labeled untrusted data, never instructions (defends the *ingestion* channel). The user's own chat message is pattern-checked for jailbreak/override attempts before it ever reaches retrieval (defends the *input* channel, added §20).
+- **PII-aware.** Source documents and live chat text are redacted (regex + NER) before embedding or before being sent to third-party observability tooling.
+- **Measured, not just monitored.** Every request is traced (Langfuse), every LLM call's cost is tracked individually, and a live-traffic product-metrics script computes auto-resolution rate, exclusion rate, and a CSAT proxy from real usage — not just an offline golden-set score.
 - **Degrades loudly, never silently.** Redis unavailable → in-memory fallback, logged. Cohere unavailable → lexical reranking, logged as a warning on every query. Langfuse unset → tracing becomes a no-op. Nothing silently produces degraded behavior without saying so in the logs.
 
 ---
@@ -23,74 +27,92 @@ Core design commitments, all visible directly in the code:
 
 | Layer | Choice | Notes |
 |---|---|---|
-| API framework | FastAPI + Uvicorn | Single process, `--reload` for dev |
-| LLM (generation + query rewrite) | Groq (`llama-3.3-70b-versatile` / `llama-3.1-8b-instant`) | Swappable to Google Gemini or HuggingFace via `LLM_PROVIDER` env var |
+| API framework | FastAPI + Uvicorn | Single process |
+| LLM (generation + query rewrite + comparison classification + groundedness judge) | Groq (`llama-3.3-70b-versatile` / `llama-3.1-8b-instant`) | Swappable to Google Gemini or HuggingFace via `LLM_PROVIDER` env var; currently running HuggingFace (`Qwen/Qwen3-4B-Instruct-2507`) after Groq's daily quota was exhausted during this session's testing |
 | Embeddings | `sentence-transformers/all-MiniLM-L6-v2`, local (HuggingFace) | Runs on-box, zero API quota risk |
-| Vector store | Chroma Cloud | No local fallback once cloud creds are set — see [§9](#9-vector-store--chroma) |
+| Vector store | Chroma Cloud | No local fallback once cloud creds are set — see [§9](#9-generation) |
 | Keyword search | BM25 (`rank_bm25`), JSON index in object storage | Runs alongside dense search, merged via RRF |
 | Reranking | Cohere Rerank (`rerank-english-v3.0`), optional | Falls back to lexical term-overlap reranking if unset |
-| Cache / sessions / rate limiting | Redis, in-memory fallback | `fakeredis` used for tests |
-| Semantic cache gate | Cross-encoder NLI (`cross-encoder/nli-deberta-v3-small`), local | See [§8.3](#83-semantic-cache--the-nli-gate) — this is the most subtle piece of the whole system |
-| Observability | Langfuse (v3+, OTel-based) + structured JSON request logs | Every request scored for citation/groundedness, not just eval runs |
-| Evaluation | RAGAS (if installed) + a fast fallback, 12-case golden set | Gates CI on regression |
-| Deployment target | GKE (Terraform-provisioned) | See [§12](#12-deployment) |
+| Cache / sessions / rate limiting | Redis (Memorystore in dev), in-memory fallback | `fakeredis` for tests; **actually wired and live-verified in `dev`** as of this session (was designed but never deployed before — see [§20](#20-recent-hardening-2026-07-16)) |
+| PII redaction | Regex (email/phone/card) + Presidio/spaCy NER (names/locations) | `utils/pii.py`, hard dependency (not optional-install), applied at ingestion and at the Langfuse boundary |
+| Prompt-injection defense | `<doc>` delimiters (retrieval-content channel) + pattern-based input guard (`utils/prompt_guard.py`, user-message channel) | Two independent channels, added in different sessions |
+| Observability | Langfuse (v4, OTel-based) + structured JSON request logs | Per-request trace, per-LLM-call generation observation (model + token usage), citation/groundedness/user-feedback all as first-class Langfuse **scores** |
+| Cost tracking | Langfuse `generation` observations per LLM call | Query rewrite, comparison classification, answer generation, and the groundedness judge are each tracked separately — see [§14](#14-cost-tracking) |
+| Product metrics | `evaluation/product_metrics.py` | Live-traffic auto-resolution rate, exclusion rate, active users, CSAT proxy — aggregated from Langfuse, no new instrumentation |
+| A/B testing | `utils/ops.py:assign_experiment_variant` + Langfuse trace tagging | Deterministic per-session bucketing, off by default |
+| Evaluation | RAGAS (if installed) + a fast fallback, 12-case golden set | Gates CI on regression — this is the *offline* counterpart to the live product-metrics script above |
+| Deployment target | Google Cloud Run (Terraform-provisioned) | See [§18](#18-deployment) |
 
 ---
 
-## 3. Architecture
+## 3. High-Level Design (HLD)
 
 ```mermaid
 flowchart TD
-    U["User (web UI / API client)"] -->|"POST /get or /get/stream<br/>X-API-Key, X-Session-Id"| MW
+    U["User (web UI / API client)"] -->|"POST /get, /get/stream, or /feedback<br/>X-API-Key, X-Session-Id"| MW
 
     subgraph FastAPI["main.py"]
         MW["API-key auth + rate limit<br/>(middleware)"]
+        GUARD0{"Prompt injection<br/>pattern match?"}
         CACHE{"Exact or<br/>semantic<br/>cache hit?"}
-        MW --> CACHE
+        MW --> GUARD0
+        GUARD0 -->|yes| BLOCKED["Refuse immediately<br/>(no retrieval, no LLM call)"]
+        GUARD0 -->|no| CACHE
     end
 
     CACHE -->|hit| RESP["Return cached answer<br/>(skip everything below)"]
     CACHE -->|miss| REWRITE
 
     subgraph Rewrite["retriever/query_rewriter.py"]
-        REWRITE["Contextualize query<br/>using last 4 chat turns<br/>(small/fast LLM)"]
+        REWRITE["Contextualize query<br/>using last 4 chat turns"]
+        CLASSIFY["Classify comparison intent<br/>(2+ named products?)"]
+        REWRITE --> CLASSIFY
     end
 
-    REWRITE --> RETRIEVE
+    CLASSIFY -->|"single product"| RETRIEVE
+    CLASSIFY -->|"2+ products"| MULTIHOP["One hybrid-search leg<br/>per product, product-filtered"]
 
     subgraph Retrieval["retriever/retrieval.py"]
         direction TB
-        DENSE["Dense search<br/>(Chroma Cloud)"]
+        DENSE["Dense search (Chroma Cloud)"]
         SPARSE["BM25 keyword search"]
-        RETRIEVE["call_retriever()"] --> DENSE
+        RETRIEVE["_hybrid_search()"] --> DENSE
         RETRIEVE --> SPARSE
         DENSE --> RRF["Reciprocal Rank Fusion merge"]
         SPARSE --> RRF
-        RRF --> RERANK{"COHERE_API_KEY<br/>set?"}
+        RRF --> RERANK{"COHERE_API_KEY set?"}
         RERANK -->|yes| COHERE["Cohere semantic rerank"]
-        RERANK -->|no| LEXICAL["Lexical term-overlap<br/>rerank (logged warning)"]
+        RERANK -->|no| LEXICAL["Lexical term-overlap rerank"]
     end
+
+    MULTIHOP --> COHERE
+    MULTIHOP --> LEXICAL
 
     COHERE --> GEN
     LEXICAL --> GEN
 
     subgraph Generation["prompt_library/prompt.py + utils/model_loader.py"]
-        GEN["product_bot prompt<br/>context in &lt;doc source=...&gt; tags<br/>temperature=0"]
+        GEN["product_bot or product_comparison_bot prompt<br/>context in &lt;doc source=...&gt; tags<br/>A/B variant may override the model<br/>temperature=0"]
     end
 
-    GEN --> GUARD
+    GEN --> GUARD1
 
     subgraph Guardrails["main.py"]
-        GUARD["Citation check:<br/>cited source_id actually retrieved?"]
-        GUARD -->|fail| REFUSE["Insufficient context<br/>(not cached)"]
-        GUARD -->|pass| JUDGE["LLM-as-judge:<br/>groundedness_verdict"]
+        GUARD1["Citation check"]
+        GUARD1 -->|fail| REFUSE["Insufficient context<br/>(not cached)"]
+        GUARD1 -->|pass| JUDGE["LLM-as-judge: groundedness"]
         JUDGE -->|fail| REFUSE
-        JUDGE -->|pass| OK["Answer accepted"]
+        JUDGE -->|pass| OK["Answer accepted, PII-redacted<br/>before it reaches Langfuse"]
     end
 
-    OK --> WRITE["Write exact + semantic cache<br/>Append session history<br/>Emit RequestTrace + Langfuse span"]
+    OK --> WRITE["Write cache, append session history,<br/>Langfuse span + per-call generation traces"]
     WRITE --> RESP
-    REFUSE --> RESP2["Return refusal<br/>(session history still updated,<br/>cache NOT written)"]
+    REFUSE --> RESP2["Return refusal<br/>(session history still updated)"]
+
+    RESP -.->|"thumbs up/down"| FEEDBACK["POST /feedback -><br/>Langfuse score on the original trace"]
+    RESP2 -.->|"thumbs up/down"| FEEDBACK
+
+    FEEDBACK --> METRICS["evaluation/product_metrics.py<br/>auto-resolution / exclusion / CSAT,<br/>optionally --by-variant"]
 ```
 
 ### Text version (for a quick skim)
@@ -98,22 +120,33 @@ flowchart TD
 ```
 User
  -> FastAPI middleware: X-API-Key auth, per-identity rate limit
+ -> Prompt-injection pattern check on the raw message
+      | match -> refuse immediately, zero retrieval/LLM calls
+      v no match
  -> Exact cache check (Redis, keyed on session_id + normalized raw query)
  -> Semantic cache check (cosine pre-filter -> NLI entailment gate)
       | hit -> return cached answer, skip everything below
       v miss
  -> Query rewrite (only if chat history exists): resolve pronouns/negation/
     multi-item references into a standalone question
+ -> Comparison-intent classification (small LLM): 2+ named products?
+      | yes -> one hybrid-search leg per product, product-name-filtered
+      v no  -> one hybrid-search leg for the whole query
  -> Hybrid retrieval: dense (Chroma) + BM25, run concurrently, merged by RRF
  -> Rerank: Cohere if configured, else lexical term-overlap fallback
- -> Generation: product_bot prompt, context as untrusted <doc> blocks,
-    temperature=0, citation required
+ -> Generation: product_bot (or product_comparison_bot for a detected
+    comparison) prompt, context as untrusted <doc> blocks, temperature=0,
+    citation required, model may be A/B-overridden for the treatment variant
  -> Citation check -> Groundedness judge (LLM-as-judge)
       | either fails -> "Insufficient context" (never cached)
       v both pass
  -> Cache write (exact + semantic) + session history append
- -> RequestTrace JSON log + Langfuse span
- -> Response to user (plain text or SSE token stream)
+ -> RequestTrace JSON log + Langfuse span, PII-redacted, tagged with the
+    A/B variant, with a nested generation observation (model + token
+    usage) per LLM call made along the way
+ -> Response to user (plain text or SSE token stream, rendered as Markdown)
+ -> Optional: thumbs up/down -> POST /feedback -> Langfuse score on the
+    same trace, joinable later via evaluation/product_metrics.py
 ```
 
 ---
@@ -126,35 +159,47 @@ config/
   config.yaml                  Provider, retrieval, ingestion settings
   config_loader.py
 retriever/
-  retrieval.py                 Hybrid search, RRF, reranking, metadata filters
-  query_rewriter.py            Multi-turn query contextualization
+  retrieval.py                 Hybrid search, RRF, reranking, metadata filters,
+                                multi-hop comparison routing
+  query_rewriter.py            Multi-turn query contextualization +
+                                comparison-intent classification
 data_ingestion/
-  ingestion_pipeline.py        Incremental ingest: land -> clean -> chunk -> dedupe -> embed
+  ingestion_pipeline.py        Incremental ingest: land -> clean -> PII-redact ->
+                                chunk -> dedupe -> embed -> archive
 utils/
   model_loader.py               LLM/embedding provider loading + caching (groq/google/huggingface)
   chroma_utils.py                Chroma Cloud vs local persistence routing
   ops.py                         ResponseCache, RateLimiter, SessionStore (Redis-backed,
-                                  in-memory fallback), request tracing, Langfuse wiring,
-                                  NLI-gated semantic cache
+                                  in-memory fallback), request tracing, Langfuse wiring
+                                  (trace + per-call generation observations + feedback
+                                  scores), NLI-gated semantic cache, A/B variant assignment
+  pii.py                         PII redaction: regex + Presidio/spaCy NER
+  prompt_guard.py                Input-side prompt-injection/jailbreak pattern detection
   bm25_index.py                  BM25 index persistence
-  object_store.py                Storage abstraction (local / gs:// / s3:// / abfs://)
-  config_loader.py
+  object_store.py                Storage abstraction (local / gs:// / s3:// / abfs://),
+                                  including the archive-after-ingest move
 prompt_library/
-  prompt.py                     System prompts: generation, groundedness judge, query rewrite
+  prompt.py                     System prompts: generation, comparison generation,
+                                 groundedness judge, query rewrite, comparison classifier
 evaluation/
-  golden_test_set.py             12 labeled test cases
+  golden_test_set.py             12 labeled test cases (offline evaluation)
   evaluator.py                   Retrieval + generation metrics (RAGAS or fallback)
   run_evaluation.py              Runs golden set, gates CI on regression vs. baseline
-tests/                          82 tests (fast, dependency-free, except test_phase4_ci.py
+  product_metrics.py             Live-traffic product metrics from real Langfuse data
+                                  (auto-resolution rate, exclusion rate, active users,
+                                  CSAT proxy), with an optional --by-variant breakdown
+tests/                          155 tests (fast, dependency-free, except test_phase4_ci.py
                                  which hits real providers)
-templates/, static/             Web chat UI (vanilla HTML/JS, no framework)
-deploy/k8s.yaml                 GKE Deployment/Service/HPA/SecretProviderClass manifest
+templates/, static/             Web chat UI (vanilla HTML/JS, no framework) --
+                                 Markdown-rendered answers (marked.js + DOMPurify),
+                                 thumbs up/down feedback buttons
+infra/                          Terraform: GCP Cloud Run, networking (VPC connector +
+                                 Memorystore), storage, secrets, IAM, WIF -- see
+                                 infra/README.md
 .github/workflows/
-  main.tf, variables.tf,
-  backend.tf, outputs.tf         Terraform: GKE cluster, Artifact Registry, IAM,
-                                  Workload Identity Federation for CI/CD
-  deploy-to-gke.yml              Build + push + deploy pipeline
-  evaluation.yml                 CI: runs tests + evaluation on every push
+  ci-fast-tests.yml              The 155-test unit suite, every push/PR, no live API calls
+  cd-{dev,test,prod}.yml         Branch-triggered: tests -> build -> deploy -> smoke test
+  rag-evaluation.yml             Quota-heavy live-provider evaluation, gated to prod/manual
 Dockerfile, docker-compose.yml  Container build + local compose (no local Redis by design)
 ```
 
@@ -166,7 +211,7 @@ All routes defined in `main.py`. Base URL in local dev: `http://localhost:8001`.
 
 ### Auth
 
-Every request to `/get` and `/get/stream` must carry:
+Every request to `/get`, `/get/stream`, and `/feedback` must carry:
 
 ```
 X-API-Key: <APP_API_KEY value>
@@ -178,10 +223,10 @@ Checked with `secrets.compare_digest` (timing-safe). Missing/wrong key → `401`
 Renders the chat UI (`templates/chat.html`). No auth.
 
 ### `GET /health`
-Liveness probe. Always `{"status": "healthy"}` if the process is up. No auth, no dependency checks — used as the Kubernetes `livenessProbe`.
+Liveness probe. Always `{"status": "healthy"}` if the process is up. No auth, no dependency checks.
 
 ### `GET /ready`
-Readiness probe — actually checks dependencies: `APP_API_KEY` set, `GROQ_API_KEY` set, Chroma storage reachable/configured. Returns `503` if any check fails. Used as the Kubernetes `readinessProbe`.
+Readiness probe — actually checks dependencies: `APP_API_KEY` set, `GROQ_API_KEY` set, Chroma storage reachable/configured. Returns `503` if any check fails.
 
 ```json
 {"status": "ready", "checks": {"app_api_key": true, "groq_api_key": true, "chroma_storage": true}}
@@ -190,7 +235,7 @@ Readiness probe — actually checks dependencies: `APP_API_KEY` set, `GROQ_API_K
 ### `POST /get`
 Single-turn or multi-turn (via `X-Session-Id`) chat, plain-text response.
 
-**Headers:** `X-API-Key` (required), `X-Session-Id` (optional, defaults to `"default"` — see [Known limitation](#known-limitations) about the web UI not sending this).
+**Headers:** `X-API-Key` (required), `X-Session-Id` (optional, defaults to `"default"` — see [Known limitations](#21-known-limitations--not-accomplished) about the web UI not sending this).
 
 **Body (form-encoded):** `msg` (string, 1-2000 chars).
 
@@ -201,10 +246,10 @@ curl -X POST http://localhost:8001/get \
   --data-urlencode "msg=Can you recommend a good budget headphone?"
 ```
 
-Response: the answer as plain text (may be the "Insufficient context..." refusal).
+Response: the answer as plain text, Markdown-formatted (may be the "Insufficient context..." refusal, or the injection-blocked refusal).
 
 ### `POST /get/stream`
-Same request shape as `/get`, but Server-Sent Events (SSE) response — used by the web UI for token-by-token streaming.
+Same request shape as `/get`, but Server-Sent Events (SSE) response — used by the web UI for token-by-token streaming, rendered live as Markdown.
 
 **Event sequence:**
 ```
@@ -218,50 +263,78 @@ event: cache
 data: miss | exact | semantic
 
 event: token
-data: <word> 
-... (repeated, one per whitespace-split word — NOT true incremental LLM
+data: "<JSON-encoded word chunk>"
+... (repeated, one per whitespace-split word -- NOT true incremental LLM
      streaming; the full answer is generated first, then replayed word by
-     word for a typing-effect UI)
+     word for a typing-effect UI. Each token's payload is JSON-encoded so
+     an embedded newline -- routine now that answers are Markdown with
+     headings/lists/tables -- survives correctly; a naive f"data: {token}"
+     silently truncated anything after the first embedded newline, a real
+     bug found and fixed this session, see §20)
 
 event: done
 data: [DONE]
 ```
 
-Note: `[DONE]` is sent regardless of success/refusal — a refusal is a normal, complete answer from the API's perspective, not an error.
+Note: `[DONE]` is sent regardless of success/refusal — a refusal is a normal, complete answer from the API's perspective, not an error. The frontend renders thumbs up/down feedback buttons once `done` fires, using the `request_id` captured from the first event.
+
+### `POST /feedback`
+
+Added this session. Records a user's thumbs up/down as a score on the original request's Langfuse trace.
+
+**Headers:** `X-API-Key` (required).
+
+**Body (JSON):** `{"request_id": "<uuid from the original request>", "rating": "up" | "down"}`.
+
+```bash
+curl -X POST http://localhost:8001/feedback \
+  -H "X-API-Key: $APP_API_KEY" -H "Content-Type: application/json" \
+  -d '{"request_id": "...", "rating": "up"}'
+```
+
+Response: `{"recorded": true}` or `{"recorded": false}` (Langfuse disabled/unavailable — never a 5xx; feedback failing must never disrupt the chat itself). The score (`user_feedback`, `BOOLEAN`, `1.0`/`0.0`) lands on the same trace as the original request's `citation_check`/`groundedness` scores, `trace_id` re-derived deterministically from `request_id` — no new storage needed.
 
 ---
 
-## 6. Query flow, in detail
+## 6. Low-Level Design — Request flow (code-level)
 
-This is `main.py`'s `invoke_chain_details()` — the one function every request (streaming or not) funnels through.
+This is `main.py`'s `invoke_chain_details()` — the one function every chat request (streaming or not) funnels through.
 
-1. **Trace + Langfuse span opened.** A `RequestTrace` object accumulates timing/metadata for the structured JSON log line emitted at the end. `build_langfuse_trace()` opens a matching span (no-op if Langfuse keys unset), with a trace ID deterministically derived from the request's own ID — so a log line and a Langfuse trace can always be cross-referenced.
+1. **Trace + variant assignment.** A `RequestTrace` object accumulates timing/metadata for the structured JSON log line. `assign_experiment_variant(session_id)` deterministically buckets the session into `"control"`/`"treatment"` (stable hash of `session_id`, not Python's randomized `hash()`) and tags the trace immediately. `build_langfuse_trace()` opens a matching Langfuse span (no-op if keys unset), trace ID deterministically derived from the request's own ID.
 
-2. **Query embedded** (`_embed_query`) — needed for the semantic cache check regardless of hit/miss. This is cached per-`ModelLoader`-instance (see [§10.1](#101-provider-client-caching)); it used to reconstruct the embedding model from scratch on every call.
+2. **Prompt-injection check** (`utils.prompt_guard.detect_prompt_injection`) — pattern-matched against the raw user message *before anything else*, including embedding computation. A match short-circuits immediately: the trace is tagged with the matched technique, a fixed refusal is returned, and retrieval/generation are never invoked at all — a latency/cost win on top of the security benefit, since a genuine product question has no legitimate reason to trip these patterns.
 
-3. **Exact cache check** (`ResponseCache.get_exact`) — keyed on `sha256(session_id + normalize(raw_query))`. Case/whitespace-insensitive, but otherwise requires the literal same text.
+3. **Query embedded** (`_embed_query`) — needed for the semantic cache check regardless of hit/miss. Cached per-`ModelLoader`-instance.
 
-4. **Semantic cache check** (`ResponseCache.get_semantic`, only if exact missed) — see [§8.3](#83-semantic-cache--the-nli-gate) for why this is more than a similarity threshold.
+4. **Exact cache check** (`ResponseCache.get_exact`) — keyed on `sha256(session_id + normalize(raw_query))`.
 
-5. **On any cache hit:** append to session history, log, return immediately. **Retrieval and generation are entirely skipped.**
+5. **Semantic cache check** (`ResponseCache.get_semantic`, only if exact missed) — see [§11.4](#114-responsecache--semantic-match-and-the-nli-gate).
 
-6. **On a miss:** build chat history (`_build_chat_history`, last 4 turns, citations stripped — see [§7](#7-citation-stripping-in-chat-history) for why).
+6. **On any cache hit:** append to session history, log (tagged with the variant), return immediately. **Retrieval and generation are entirely skipped.**
 
-7. **Retrieval** (`retriever_obj.call_retriever`) — see [§8](#8-retrieval-in-detail).
+7. **On a miss:** build chat history (`_build_chat_history`, last 4 turns, citations stripped — see [§7](#7-citation-stripping-in-chat-history)).
 
-8. **Generation** — `product_bot` prompt (see [§9.2](#92-the-generation-prompt)), `temperature=0`, context passed as `<doc source="ID">...</doc>` blocks.
+8. **Retrieval** (`retriever_obj.call_retriever`) — see [§8](#8-retrieval-in-detail) for the single-query path and the multi-hop comparison branch.
 
-9. **Guardrails, in order:**
-   - If retrieval returned nothing → immediate refusal, no LLM guardrail calls needed.
-   - **Citation check** (`_verify_citations`) — regex-extracts every `source:ID` token from the answer (not just whole `[...]` brackets — a model bundling multiple citations into one bracket, e.g. `[source:A, source:B]`, is handled) and checks each against the set of actually-retrieved source IDs. Any mismatch → refusal.
-   - **Groundedness judge** (`_judge_groundedness`) — a separate LLM call, strict YES/NO, asks "is this answer actually supported by this context?" Independent of the citation check — an answer can cite real IDs but still misrepresent what they say.
-   - Either check failing → the answer is replaced with one of two fixed refusal strings (`INSUFFICIENT_CONTEXT_NO_DOCS` / `INSUFFICIENT_CONTEXT_UNGROUNDED`), never the model's actual (possibly ungrounded) text.
+9. **Prompt selection.** `retriever_obj.last_comparison_products` (set by the call above) picks `product_comparison_bot` (asks for a Markdown comparison table) when a comparison was detected, `product_bot` otherwise.
 
-10. **Cache write** — **only if the output is not a refusal.** A citation/groundedness failure is often transient (LLM sampling variance), so caching it would make the refusal "sticky" for the whole TTL, refusing a genuinely answerable question repeatedly until expiry.
+10. **Model selection.** `_ab_test_model_override(variant)` returns an override model name only when `AB_TEST_ENABLED=true` *and* the session landed in `"treatment"` *and* `AB_TEST_MODEL_NAME` is set — otherwise the normally-configured model is used, which is every request by default (the experiment is off unless deliberately turned on).
 
-11. **Session history append** — happens unconditionally (even for a refusal — the conversation did happen).
+11. **Generation** — the selected prompt, `temperature=0`, context passed as `<doc source="ID">...</doc>` blocks, tracked as a nested Langfuse `generation` observation (model + token usage from the LLM response's `usage_metadata`) — see [§14](#14-cost-tracking).
 
-12. **Trace finished, Langfuse span closed** with `citation_check`/`groundedness` recorded as first-class Langfuse *scores* (chartable trend lines, not buried metadata).
+12. **Guardrails, in order:**
+    - If retrieval returned nothing → immediate refusal, no LLM guardrail calls needed.
+    - **Citation check** (`_verify_citations`) — regex-extracts every `source:ID` token from the answer and checks each against the set of actually-retrieved source IDs. Any mismatch → refusal.
+    - **Groundedness judge** (`_judge_groundedness`) — a separate LLM call (also tracked as its own Langfuse generation), strict YES/NO, asks "is this answer actually supported by this context?"
+    - Either check failing → the answer is replaced with a fixed refusal string, never the model's actual (possibly ungrounded) text.
+
+13. **Cache write** — only if the output is not a refusal (a citation/groundedness failure is often transient sampling variance; caching it would make the refusal sticky for the whole TTL).
+
+14. **Session history append** — happens unconditionally, even for a refusal.
+
+15. **Trace finished, Langfuse span closed.** `citation_check`/`groundedness` recorded as first-class Langfuse scores. The question, the answer, and every nested generation's input/output are **PII-redacted** (`utils/pii.py`) before this data leaves the process — see [§13](#13-pii-redaction).
+
+16. **Later, optionally:** a thumbs up/down hits `POST /feedback`, which re-derives the same trace ID from `request_id` and records a `user_feedback` score post-hoc, no live span needed.
 
 ---
 
@@ -275,28 +348,19 @@ This is `main.py`'s `invoke_chain_details()` — the one function every request 
 
 `retriever/retrieval.py`'s `Retriever.call_retriever()`:
 
-1. **Query rewrite** (`contextualize_query`, `retriever/query_rewriter.py`) — skipped entirely if there's no chat history yet (first turn). Uses a small/fast model (`llama-3.1-8b-instant` by default) with an explicit prompt contract:
-   - Resolve pronouns/implicit references ("the cheaper one") using history.
-   - **Preserve polarity exactly** — a negated follow-up ("do they sound bad?") must not get flipped positive just because prior history leaned positive. (Found and fixed 2026-07-14 — see [§13](#13-recent-hardening-2026-07-14).)
-   - **Don't collapse an ambiguous singular reference onto one item** — "tell me more about it" after the assistant listed several distinct products should expand to name all of them, not silently pick the last one mentioned. (Also fixed 2026-07-14; known to still have a downstream retrieval-precision limitation — see [§14](#14-known-limitations--parked-work).)
+1. **Query rewrite** (`contextualize_query`, `retriever/query_rewriter.py`) — skipped entirely if there's no chat history yet (first turn). Uses a small/fast model with an explicit prompt contract: resolve pronouns, preserve negation polarity exactly, and expand an ambiguous singular reference ("tell me more about it") to *all* named items from a multi-item prior answer rather than silently picking the last one.
 
-2. **Lexical query expansion** (`rewrite_query`) — a fixed synonym table (`headphone` → `headphones earphones earbuds`, `budget` → `budget affordable cheap low cost`, etc.), applied to the rewritten query before search. Deliberately dumb/deterministic, not LLM-based.
+2. **Comparison-intent classification** (`classify_comparison_products`, same small model — a 4th per-request LLM call, chosen over a regex heuristic per an explicit decision to prioritize reliability on varied phrasing over cost). Asks the model to name 2+ products if the (already-resolved) question is comparing them directly, using a `"PRODUCT: <name>"` line-per-product format — deliberately not JSON, far more reliable for a small model to produce correctly. Fewer than 2 extracted names, or any failure, means "not a comparison" and the normal single-query path runs — retrieval must never hard-fail because classification failed.
 
-3. **Metadata filter parsing** (`parse_metadata_filters`) — regex-extracts `field OP value` patterns like `rating>=4` from the *original* (not rewritten) query. Supported fields: `rating`, `price`, `category`, `product_name`, `brand`. **Only `rating` actually matches anything against the bundled demo dataset** — the CSV has no price/category/brand columns (see [Known limitations](#14-known-limitations--parked-work)).
+3. **Branch — comparison detected:** one full hybrid-search leg *per product* (`_retrieve_comparison`), each filtered to its own `product_name` metadata so one product's stronger matches can't crowd out the other's. Results stay grouped by product in the returned list; each chunk's `page_content` already starts with `"Product: <name>"` (§20's CSV embedding fix), so the LLM sees clearly which product each block of evidence is about even without an explicit section header.
 
-4. **Hybrid search, run concurrently** (`ThreadPoolExecutor`, 2 workers):
+4. **Branch — no comparison:** the original single-query path. Lexical query expansion (`rewrite_query`, a fixed synonym table), metadata filter parsing (`rating`/`price`/`category`/`product_name`/`brand` — only `rating` actually matches anything against the bundled demo dataset), then one hybrid-search leg.
+
+5. **Hybrid search** (`_hybrid_search`, shared by both branches), **run concurrently** (`ThreadPoolExecutor`, 2 workers):
    - **Dense**: Chroma similarity search via `retriever.invoke()`.
-   - **Sparse**: BM25 keyword search (`utils/bm25_index.py`), index reloaded from storage at most every 60s (`BM25_REFRESH_SECONDS`) since it's rebuilt by the ingestion job, not this process.
-   - Candidate pool size (`_candidate_pool_top_k`): 20 if Cohere reranking is active, 10 otherwise — a real semantic reranker benefits from more candidates; the crude lexical fallback reranker gets *worse* with more (more chances for an irrelevant-but-lexically-similar doc to outrank the genuinely relevant one).
-
-5. **Metadata filters applied** to both result sets independently.
-
-6. **Reciprocal Rank Fusion merge** (`rrf_merge`, k=60) — standard RRF scoring (`1/(k + rank + 1)` per list, summed), not a naive concatenation, so a document ranked highly in *both* dense and sparse search outranks one that only one method liked.
-
-7. **Rerank** (`_rerank`):
-   - Cohere Rerank if `COHERE_API_KEY` set (with an optional relevance-score floor).
-   - Cohere call failing at runtime → caught, falls back to lexical.
-   - No key at all → lexical term-overlap reranking (`rerank_documents`), logged as a **warning on every single query** so this degraded mode is never silent. Final count via `dynamic_top_k` (3/4/5 depending on candidate pool size).
+   - **Sparse**: BM25 keyword search (`utils/bm25_index.py`), index reloaded from storage at most every 60s since it's rebuilt by the ingestion job, not this process.
+   - Candidate pool size: 20 if Cohere reranking is active, 10 otherwise.
+   - Metadata filters applied to both result sets independently, then merged via **Reciprocal Rank Fusion** (k=60), then **reranked** (Cohere if configured, else lexical term-overlap, logged as a warning on every query so degraded mode is never silent).
 
 ---
 
@@ -304,20 +368,20 @@ This is `main.py`'s `invoke_chain_details()` — the one function every request 
 
 ### 9.1 Vector store: Chroma
 
-`utils/chroma_utils.py`'s `create_chroma_store()`. Key decision: **once cloud credentials are configured, cloud is used unconditionally — there is no silent fallback to local storage on a cloud error.** A quota/timeout/auth failure surfaces as a loud `RuntimeError`, not a quiet fork into a second, divergent local index that only one replica can see. Local persistence (`chroma_db/` folder) is reached *only* when no cloud credentials exist anywhere and no explicit mode is set — logged as a warning so nobody mistakes it for the cloud store.
+`utils/chroma_utils.py`'s `create_chroma_store()`. Once cloud credentials are configured, cloud is used unconditionally — no silent fallback to local storage on a cloud error; a quota/timeout/auth failure surfaces as a loud `RuntimeError`.
 
-### 9.2 The generation prompt
+### 9.2 The generation prompts
 
-`prompt_library/prompt.py`'s `product_bot` template:
+`prompt_library/prompt.py` has two generation templates:
 
-- Context passed as `<doc source="ID">...</doc>` blocks, explicitly labeled **untrusted, not instructions** — a direct prompt-injection defense: review text is user-generated and could contain an embedded instruction ("ignore previous instructions and..."), and the prompt tells the model to treat it purely as evidence, never as directives, even if it claims to be from "the system."
-- Every factual claim must carry a `[source:ID]` citation.
-- Explicit instruction to say "Insufficient context" rather than guess.
-- **Completeness instruction** (added 2026-07-14): when a follow-up asks to recall/list something from chat history, the model must account for *every* relevant item mentioned there, not just the most prominent one — direct fix for an observed bug where a 3-item recommendation got recalled as if it were 1-item.
+- **`product_bot`** — the default. Context as untrusted `<doc source="ID">` blocks. Explicitly instructed to format the answer in **Markdown** (bullets for multiple points, tables for structured comparisons, short paragraphs — not one dense wall of text) with each citation attached to the specific claim it supports, not moved to a trailing list. A completeness instruction covers multi-item recall from chat history.
+- **`product_comparison_bot`** — used when the comparison classifier (§8.2) fires. Same untrusted-context framing, but explicitly asks for a **Markdown table** comparing the named products side by side on the attributes in question, with an explicit instruction to mark a product's cell "No data" rather than guess when its context is insufficient.
+
+Both share the same injection-defense line: context is data, never instructions, even if a `<doc>` block claims otherwise.
 
 ### 9.3 Determinism
 
-`ModelLoader.load_llm()` sets `temperature=0` across all three providers (Groq: `temperature=0`; Google: `temperature=0`; HuggingFace: `do_sample=False` — HF's TGI-based endpoints typically reject `temperature=0` outright, so greedy decoding is requested the correct way for that provider instead). Added 2026-07-14 after observing the same question asked twice in one session produce meaningfully different answers. **This tightens but does not fully eliminate variance** — retrieval became fully deterministic (identical `retrieved_source_ids` across repeats) but generation still shows minor differences occasionally, most likely because Groq's serving infrastructure uses continuous batching, and floating-point ops aren't strictly associative across different batch compositions — a ceiling on determinism inherent to any shared, high-throughput inference API, not fixable from this codebase.
+`ModelLoader.load_llm()` sets `temperature=0` across all three providers (HF: `do_sample=False`, since TGI-based endpoints typically reject `temperature=0` outright). Retrieval is fully deterministic; generation still shows occasional minor variance, most likely from continuous-batching non-associativity on the serving side — a ceiling inherent to any shared, high-throughput inference API, not fixable from this codebase.
 
 ---
 
@@ -327,160 +391,248 @@ This is `main.py`'s `invoke_chain_details()` — the one function every request 
 
 ### 10.1 Provider client caching
 
-**This was the single biggest latency bug found in this project.** `load_embeddings()` and `load_llm()` originally reconstructed their client objects from scratch on *every call* — for embeddings specifically, that meant reloading the full sentence-transformer model from disk into memory on every single chat request (measured: **5.6–7.4s per call**, vs. **~7ms** when reused). Both are now cached:
-
-- `load_embeddings()` — cached as `self._embeddings`, a single instance per `ModelLoader` object.
-- `load_llm()` — cached in `self._llm_cache`, keyed by `(provider, model_name)`, since the same instance is called with different models (main generation vs. groundedness judge vs. — in `Retriever` — the query-rewrite model).
-
-Net effect: warm-request latency dropped roughly 4x (measured **7.9–8.5s → 2.0–2.1s**) in live testing.
+`load_embeddings()` is cached as `self._embeddings` (a single instance per `ModelLoader`); `load_llm()` is cached in `self._llm_cache`, keyed by `(provider, model_name)` — the same instance is called with different models across the request (main generation vs. groundedness judge vs. query-rewrite vs. comparison classification vs. an A/B-overridden model), so a naive uncached implementation would reconstruct clients repeatedly within a single request.
 
 ### 10.2 Provider quick-switch
 
-`LLM_PROVIDER` / `LLM_MODEL_NAME` / `LLM_REWRITE_MODEL_NAME` env vars take precedence over `config.yaml` whenever set — a one-line env change instead of an edit + redeploy when a provider's quota is hit mid-session. Embedding provider is **deliberately not** switchable this way: changing it means re-ingesting into a new Chroma collection (different embedding models = incompatible vector spaces), so that stays a considered `config.yaml` edit, not a quick env flip.
+`LLM_PROVIDER` / `LLM_MODEL_NAME` / `LLM_REWRITE_MODEL_NAME` env vars take precedence over `config.yaml` whenever set. As of this session, `.env` is set to `LLM_PROVIDER=huggingface` with `Qwen/Qwen3-4B-Instruct-2507`, switched mid-session after Groq's daily token cap was fully exhausted by cumulative testing. Embedding provider is deliberately **not** switchable this way — see the ingestion note in §17.
 
-### 10.3 Provider quota realities (learned firsthand)
+### 10.3 A/B test model override
+
+`main.py:_ab_test_model_override(variant)` is a *fourth* override layer, narrower than the above: it only applies to the main answer-generation call, only for sessions bucketed into `"treatment"`, and only when `AB_TEST_ENABLED=true` is explicitly set (off by default — never silently starts spending on a second model). See [§16](#16-ab-testing).
+
+### 10.4 Provider quota realities (learned firsthand)
 
 | Provider | Failure mode | Notes |
 |---|---|---|
-| Groq | Daily token cap (~100k TPD observed on `llama-3.3-70b-versatile`) | Resets on a fixed daily cycle, not rolling. Heavy automated testing burns through it fast. |
+| Groq | Daily token cap (~100k TPD observed on `llama-3.3-70b-versatile`) | Resets on a fixed daily cycle, not rolling. Fully exhausted during this session's testing. |
 | Google (Gemini) | Free tier only if the API key's project has **no Cloud Billing account linked** | A billing-linked project draws from a separate "Prepay" balance; hitting $0 there gives a different, easy-to-miss `RESOURCE_EXHAUSTED` error. |
-| HuggingFace | Small **monthly** credit pool via the serverless Inference router, separate from the other two | A single eval run against a 70B model can exhaust it. Embeddings via HF run **locally** (no API, no quota risk — the most robust of the three for that specific role). |
+| HuggingFace | Small **monthly** credit pool via the serverless Inference router | Embeddings run **locally** (no API, no quota risk). Currently the active LLM provider for this project. |
 
 ---
 
 ## 11. Caching architecture
 
-`utils/ops.py`. Three independent Redis-backed subsystems, all with a graceful in-memory fallback (logged loudly) when `REDIS_URL` is unset.
+`utils/ops.py`. Three independent Redis-backed subsystems, all with a graceful in-memory fallback (logged loudly) when `REDIS_URL` is unset. **As of this session, Redis is genuinely wired and live-verified in `dev`** — Memorystore Basic tier + a VPC connector (`infra/modules/gcp/networking`), previously only designed/tested against in-memory fallback. See [§18](#18-deployment) for what it took to get there.
 
 ### 11.1 SessionStore
-Per-session chat history (`rag:session:{id}` list in Redis). `append()`/`get_recent(limit)`. Trimmed to `SESSION_MAX_TURNS` (default 20), expires after `SESSION_TTL_SECONDS` (default 86400). Only the last 4 turns are ever pulled into a prompt (`main.py:_build_chat_history`).
+Per-session chat history (`rag:session:{id}` list in Redis). Trimmed to `SESSION_MAX_TURNS` (default 20), expires after `SESSION_TTL_SECONDS` (default 86400). Only the last 4 turns are ever pulled into a prompt.
 
 ### 11.2 RateLimiter
-Fixed-window counter (`rag:rate:{identity}`), default 30 requests / 60s. `INCR` + `EXPIRE` on first hit.
+Fixed-window counter (`rag:rate:{identity}`), default 30 requests / 60s.
 
 ### 11.3 ResponseCache — exact match
-`rag:exact:{sha256(session_id + normalized_query)}`, JSON payload, TTL = `CACHE_TTL_SECONDS` (default 3600). **Never written for a refusal answer** (fixed 2026-07-14 — see [§13](#13-recent-hardening-2026-07-14)).
+`rag:exact:{sha256(session_id + normalized_query)}`, TTL = `CACHE_TTL_SECONDS` (default 3600). Never written for a refusal answer.
 
 ### 11.4 ResponseCache — semantic match, and the NLI gate
 
-This is the most non-obvious piece of engineering in the codebase, worth understanding in full.
+The most non-obvious piece of engineering in the codebase. Raw cosine similarity on `all-MiniLM-L6-v2` ranks a **negated opposite** ("good battery life" vs. "poor battery life", ~0.95–0.98) *above* a genuine paraphrase ("sound quality" vs. "audio quality", ~0.89) — no single threshold can separate the two.
 
-**The naive version** (raw cosine similarity threshold) was tested live and found to have a serious correctness bug: on `all-MiniLM-L6-v2`, a genuine paraphrase ("sound quality" vs. "audio quality") scored **0.89** cosine similarity — while a **negated opposite** ("good battery life" vs. "poor battery life") scored **0.95–0.98**, *higher* than the real paraphrase. There is no single cosine threshold that accepts paraphrases while rejecting negated opposites — negation barely moves embedding space for this model class, a well-known limitation, not a tuning problem.
-
-**The fix**, implemented in `utils/ops.py`:
-
-1. `rag:semantic:index` (a Redis list, capped at `SEMANTIC_CACHE_MAX_ENTRIES`, session-scoped) stores each cached query's normalized text + embedding.
-2. `get_semantic()` first does a **cheap cosine pre-filter** — `SEMANTIC_CACHE_CANDIDATE_THRESHOLD` (default `0.80`), just to shortlist candidates worth the more expensive check. This is *not* the hit decision.
-3. Candidates are ranked by cosine descending; the top `SEMANTIC_CACHE_MAX_NLI_CHECKS` (default 5) are checked with `_is_paraphrase()` — a cross-encoder NLI model (`cross-encoder/nli-deberta-v3-small`, `SEMANTIC_CACHE_NLI_MODEL` env-overridable), run **bidirectionally**: entailment required forward (cached query → incoming), no contradiction required reverse. Both directions matter — on a tested negation pair, one direction alone gave a weak/ambiguous signal, but the other correctly flagged contradiction.
-4. First candidate to pass wins. None pass → genuine cache miss, falls through to full retrieval+generation.
-5. The NLI model itself is a **lazy-loaded module-level singleton** (`_get_nli_model()`) — loaded once per process (~5.3s, ~552MB on disk), not per call (~32ms per subsequent `_is_paraphrase()` call).
-
-Cost profile: zero API/monetary cost (runs locally, same as embeddings), ~500MB-1GB additional RAM while loaded, negligible per-request latency once warm.
-
-### 11.5 Langfuse client
-`build_langfuse_trace()`/`finish_langfuse_trace()` — also fixed to a module-level singleton 2026-07-14 (was previously reconstructing the `Langfuse()` client, with its OTel exporter setup, on every request — measured ~5.9s, which was the dominant cost on a cache hit specifically, since everything else on that path is fast).
+**The fix:** a cheap cosine pre-filter (`SEMANTIC_CACHE_CANDIDATE_THRESHOLD`, default 0.80) shortlists candidates, then the top few are checked with a **bidirectional NLI cross-encoder** (`cross-encoder/nli-deberta-v3-small`) — entailment required forward, no contradiction required reverse. Loaded once as a lazy module-level singleton (~5.3s cold, ~32ms warm per check thereafter).
 
 ---
 
-## 12. Deployment
+## 12. Ingestion pipeline
 
-- **Container**: `Dockerfile` — `python:3.12-slim`, non-root user, `HEALTHCHECK` against `/health`, CPU-only PyTorch wheel (avoids ~300MB of dead CUDA weight per image). Unchanged by the Cloud Run migration below.
-- **Local multi-container**: `docker-compose.yml` — app + an on-demand `ingest` one-shot job sharing volumes. Deliberately **no local Redis service** — `REDIS_URL` is expected to point at a real managed Redis even in this context.
-- **Deployment target: Cloud Run** (`infra/`), migrated 2026-07-15 from an earlier GKE-based setup. See `infra/README.md` for the full module/environment layout. Summary:
-  - Three environments — dev, test, prod — each a separate Terraform root (`infra/environments/{dev,test,prod}`) with its own state prefix, deploying from `developer`/`staging`/`main` respectively.
-  - GCP is the only implemented provider; `infra/modules/{aws,azure}` are typed interface stubs (zero resources) so a `cloud_provider` Terraform variable is a real, validated extension point without pretending to support clouds this project has no way to test.
-  - Secrets are wired via Cloud Run's native Secret Manager integration (`infra/modules/gcp/secrets` + `cloud-run-service`/`cloud-run-job`'s `secret_key_ref`) — this replaced an earlier, broken `SecretProviderClass`/CSI-driver approach from the GKE era that silently failed to sync for days.
-  - CI/CD (`.github/workflows/cd-{dev,test,prod}.yml`) is branch-triggered and split so the fast, quota-free 82-test unit suite (`ci-fast-tests.yml`) runs on every push/PR, while the quota-heavy live-provider evaluation (`rag-evaluation.yml`) only runs before a prod deploy or on manual dispatch.
-- **Prior GKE deployment (removed)**: an earlier setup deployed to a GKE cluster via `deploy/k8s.yaml` and `.github/workflows/deploy-to-gke.yml`. That cluster was found broken during 2026-07-14 testing (a CSI Secrets Store driver name mismatch caused the app pods to silently fail to start for 3+ days while still billing) and was torn down, along with an associated Memorystore Redis instance and orphaned networking resources. All of it — the K8s manifest, the GKE-specific Terraform, and the old CI workflow — has since been deleted and replaced by the Cloud Run setup above; local testing that day used a temporary Docker Redis container instead of the (now-deleted) managed instance.
+`data_ingestion/ingestion_pipeline.py`. Designed as a stateless, repeatable job: **landing storage → clean → PII-redact → dedupe → chunk → embed → upsert → archive**.
 
-### 12.1 `dev` is live (2026-07-16)
+### 12.1 Landing → processed → archive
 
-`infra/environments/dev` is fully applied and verified end to end — not just `terraform validate`-clean. Confirmed live:
+Source files (PDF, CSV) live in a cloud-agnostic landing path (`utils/object_store.py`, local folder or `gs://`/`s3://`/`abfs://`). Change detection is two-layered:
+- **File-level**: a fingerprint (size + mtime) decides whether a file needs (re)processing at all.
+- **Chunk-level**: `build_document_id` content-hashes each chunk, so an unchanged row inside a changed file is still skipped — a form of change-data-capture at record granularity.
+
+After a successful run, `_archive_files` moves each processed file from the landing prefix to an archive prefix (`utils/object_store.py:move_file`), so landing only ever holds files not yet processed. Added this session — previously the demo dataset was baked directly into the Docker image as a stopgap, which the deployed `dev` ingestion job depended on until it was replaced with a real GCS-landing-bucket flow.
+
+### 12.2 CSV ingestion and the embedding-content fix
+
+`_documents_from_dataframe` recognizes the review-style schema (`product_title`/`rating`/`summary`/`review`). **Fixed this session:** `page_content` previously embedded only the `review` text — `product_title`/`summary` were metadata-only, invisible to both dense and BM25 search (which both index off `page_content`). A query naming a product directly ("How is the Boat Rockerz 235v2?") only matched if a review happened to repeat those exact words. `page_content` now includes labeled `Product`/`Rating`/`Summary`/`Review` lines (missing fields dropped, not rendered as the literal string `"nan"`). This changed what gets hashed into chunk IDs, so the Chroma collection was wiped and cleanly re-ingested rather than left with stale duplicate-content chunks alongside the new format.
+
+### 12.3 PII redaction at ingestion
+
+Both the CSV and PDF loaders run `redact_pii()` (§13) on extracted text before it's chunked — source documents are exactly as untrusted as live chat input from a PII standpoint.
+
+### 12.4 Scale
+
+Current implementation uses `pandas.read_csv` + `df.iterrows()` (a Python row loop) and sequential Chroma upserts (batched at 250 records, Chroma Cloud's write cap). This is adequate for the current dataset size; **deliberately not optimized further** without a real volume number demanding it — see [§21](#21-known-limitations--not-accomplished).
+
+---
+
+## 13. PII redaction
+
+`utils/pii.py`. Two layers, applied together:
+
+- **Regex**, for structured PII: emails, phone numbers, card-like numbers. Patterns are deliberately narrow enough to not false-positive on this app's own data shape (ratings like `4.5`, model numbers like `235v2`).
+- **NER via Presidio** (spaCy `en_core_web_sm` under the hood, explicitly configured — Presidio's default expects the much larger `en_core_web_lg`), for names and locations regex can't catch.
+
+Applied at two exposure surfaces:
+- **Ingestion** (§12.3) — source documents before embedding.
+- **The Langfuse boundary** (`utils/ops.py`) — trace input/output and every nested generation observation's input/output, before any of it leaves the process. The LLM itself still sees the real, unredacted text (it needs the real data to answer correctly) — redaction happens specifically at the point data would otherwise persist to a third-party observability tool with no retention policy of its own.
+
+Deliberately a **hard dependency** in `requirements.txt`, not `requirements-optional.txt` — a silently-skipped security control is worse than a missing feature (see §20's Langfuse-never-installed bug, the exact failure mode this decision avoids repeating).
+
+---
+
+## 14. Cost tracking
+
+`utils/ops.py:start_llm_generation`/`finish_llm_generation`. Every LLM call in a request — query rewrite, comparison classification, main answer generation, groundedness judge — is wrapped as its own nested Langfuse **`generation`** observation (not a plain span), tagged with the actual model name and `usage_details` translated from the LangChain response's `usage_metadata`. This is what makes Langfuse's own cost dashboard compute per-model/per-step token cost automatically, instead of the client being fully wired but only ever producing a single opaque top-level span with no model/token information (which is what existed before this session).
+
+---
+
+## 15. Prompt-injection defense (two channels)
+
+- **Retrieval-content channel** (defended before this session): ingested review text is wrapped in `<doc source="ID">` tags and the generation prompts explicitly instruct the model to treat that content as data, never as instructions, even if a block claims to be from "the system." Backed structurally by `_verify_citations` (an answer citing an ID that wasn't retrieved is rejected, independent of what the model claims) and `_judge_groundedness` (a second, independent LLM-as-judge check).
+- **User-input channel** (added this session, `utils/prompt_guard.py`): the chatting user's own message is checked against five pattern categories — instruction override ("ignore previous instructions"), system-prompt leak ("what is your system prompt"), role override ("you are now DAN"), developer-mode requests, and fake role markers (a message starting a line with `"System:"`). Pattern-based rather than an LLM call — a proportionate response to a threat this project's own risk assessment rated lower than the retrieval-content channel, and blocking immediately is a latency/cost win on top of the security benefit (zero retrieval/LLM calls for a detected attempt). A match is tagged on the trace (`prompt_injection_technique`) and blocks the request with a fixed refusal.
+
+---
+
+## 16. Outcome signal and product metrics
+
+Before this session, nothing captured whether an answer was actually useful — only technical-tier signals (citation pass rate, groundedness pass rate, latency) existed.
+
+- **Outcome signal**: `POST /feedback` (§5) records a thumbs up/down as a `user_feedback` Langfuse score, landing on the same trace as `citation_check`/`groundedness`, joinable for free.
+- **Product metrics**: `evaluation/product_metrics.py` pages Langfuse's public API for a time window and computes, with **no new instrumentation**:
+  - **Auto-resolution rate** / **exclusion rate** / **error rate** — replays `main.py`'s own `citation_check`/`groundedness_verdict` decision per trace (resolved / excluded / errored) rather than re-deriving it from raw text, so it can never drift from what the app actually decided.
+  - **Active users** — distinct `session_id` count in the window.
+  - **CSAT proxy** — thumbs-up ratio from `user_feedback` scores.
+  - Run with `python -m evaluation.product_metrics [--hours N] [--by-variant]`.
+  - **Business-tier metrics** (saved revenue, time saved per ticket vs. a human-agent baseline) are deliberately **not** computed — they need an external business input this system has no source of, and are documented as out of scope rather than faked.
+
+This is the live-traffic counterpart to `evaluation/evaluator.py`'s offline golden-set evaluation (technical tier only, fixed test set).
+
+---
+
+## 17. A/B testing
+
+`utils/ops.py:assign_experiment_variant(session_id)` deterministically buckets each session into `"control"`/`"treatment"` via a stable hash (MD5, not Python's per-process-randomized built-in `hash()`) — a session stays in the same variant for its whole conversation, no storage needed. No bespoke experimentation framework: the assignment is this one function, and the entire "analysis" side is `evaluation/product_metrics.py --by-variant`, grouping the same metrics from §16 by the `experiment_variant` tag already on every trace's metadata.
+
+Currently wired to route the treatment variant to a different model for the main answer generation only (§10.3), gated behind `AB_TEST_ENABLED`/`AB_TEST_MODEL_NAME` — **off by default, not set on the deployed `dev` service**, inert until deliberately turned on.
+
+---
+
+## 18. Deployment
+
+- **Container**: `Dockerfile` — `python:3.12-slim`, non-root user, `HEALTHCHECK` against `/health`, CPU-only PyTorch wheel. Now also installs `redis` (client library) and downloads the `en_core_web_sm` spaCy model for Presidio, both added this session after being found missing from the deployed image despite being needed at runtime.
+- **Local multi-container**: `docker-compose.yml` — deliberately **no local Redis service**.
+- **Deployment target: Cloud Run** (`infra/`). Three environments — dev, test, prod — each a separate Terraform root, deploying from `developer`/`staging`/`main` respectively. GCP is the only implemented provider.
+
+### 18.1 Redis, for real, in `dev` (this session)
+
+`infra/modules/gcp/networking` now provisions a Basic-tier Memorystore instance plus the Private Services Access VPC peering it requires, gated behind `enable_vpc_connector` (set `true` for `dev`). `REDIS_URL` is wired through Secret Manager the same way every other secret is. Getting this live surfaced five distinct real bugs, each a genuine "terraform apply succeeded" trap that only live verification caught:
+1. `google_vpc_access_connector` names are capped at 25 characters — `app_name` alone doesn't fit with any suffix. Fixed with a short hashed name.
+2. `vpcaccess.googleapis.com` and `servicenetworking.googleapis.com` both needed adding to the enabled-services list.
+3. The connector needs explicit `min_instances`/`max_instances` now — the provider no longer silently defaults these.
+4. The `redis` Python client was only ever in `requirements-optional.txt`, which the Dockerfile never installed — infra can be perfectly wired and the app will still silently run on in-memory fallback (`utils/ops.py`'s `_build_redis_client` fails soft on `ModuleNotFoundError`, by design, which is exactly what made this invisible without live verification).
+5. **The Cloud Run Service and the ingestion Job are separate deployables with independent container images** — fixing/rebuilding one does not touch the other. The first post-fix ingestion run silently archived nothing new because the Job was still on a stale pre-fix image.
+
+### 18.2 The Langfuse-never-installed bug
+
+Found mid-session while verifying the cost-tracking work against the deployed service: `langfuse` was *also* only in `requirements-optional.txt` — the exact same failure class as Redis above, just a different package. Fixed by moving it into `requirements.txt` as a hard dependency. This also invalidated an earlier "verified against the deployed service" claim for the cost-tracking feature — that check hadn't filtered by session ID, so it was actually reading a local test trace, not a deployed-service one. Re-verified properly afterward.
+
+### 18.3 CI/CD
+
+- `ci-fast-tests.yml` — the 155-test unit suite, every push/PR, no live API calls.
+- `cd-dev.yml` / `cd-test.yml` / `cd-prod.yml` — branch-triggered: tests → build (once, promoted across environments) → deploy (ingestion job, then the Cloud Run service, then a `/health`+`/ready` smoke test).
+- `rag-evaluation.yml` — the quota-heavy live-provider evaluation, gated off the routine path.
+
+### 18.4 A recurring git workflow gotcha (worth knowing)
+
+Almost every PR merged in this session after the first hit "not mergeable" on `gh pr merge`, because squash-merging doesn't rebase the feature branch's own history to match the target branch's new squashed commit — the two diverge in commit *structure* (not usually content) after every squash merge. Resolved each time with a non-destructive `git fetch` + `git merge` + conflict resolution (almost always trivial: one side of a conflict block is empty, meaning "keep the feature branch's addition"; occasionally, when the same file was touched twice in one session, both sides have real content, requiring the file to be reconstructed from the known-working version rather than a blind whole-file discard) — never `reset --hard`/force-push.
+
+### 18.5 `dev` is live and verified
 
 ```
 $ curl https://customer-support-rag-dev-udytqlhsma-uw.a.run.app/ready
 {"status":"ready","checks":{"app_api_key":true,"groq_api_key":true,"chroma_storage":true}}
 ```
 
-The ingestion job ran for real (542 chunks from the bundled demo dataset embedded into Chroma Cloud + the BM25 index), and a real query through the deployed app (`/get`) returned a correctly-grounded, cited answer — the full pipeline working on Cloud Run, not just health checks passing. `test`/`prod` are not yet applied.
-
-Cost note: `min_instance_count = 0` for dev, so it scales to zero when idle — leaving it running costs ~$0/day unless actively receiving traffic (Cloud Run bills per-second of request processing, not per-second of existence). This is a direct, deliberate contrast with the old GKE cluster, which billed continuously for 3+ days while silently broken.
-
-**Real bugs found getting `dev` live** — every one hit on the actual first deploy, not hypothetical, worth knowing before applying `test`/`prod`:
-
-1. An unquoted YAML description mixing `"quotes"` and `{braces}` in `_reusable-deploy.yml` got the *entire* workflow file silently rejected by GitHub — zero jobs created, no job-level error to debug from. Found via `actionlint` (a GitHub-Actions-aware linter, installed specifically because generic YAML validation doesn't catch this class of error) plus fetching the actual Actions run page (the specific rejection reason isn't exposed via the REST API at all).
-2. Reusable workflow jobs only get the permissions the *caller* explicitly grants (`permissions: id-token: write` for WIF auth) — declaring them inside the reusable workflow file alone isn't sufficient. Silent zero-jobs rejection again until fixed.
-3. A local composite action (`./.github/actions/gcp-auth`) needs `actions/checkout` in the same job first, or the runner can't find its own `action.yml` on disk.
-4. The deployer service account needs `roles/artifactregistry.reader` alongside `roles/run.admin` + `roles/iam.serviceAccountUser` — without it, `gcloud run deploy` can push an image and then immediately fail to pull it back down (`PERMISSION_DENIED: artifactregistry.repositories.downloadArtifacts`).
-5. `roles/storage.objectAdmin` on a GCS bucket grants **zero** bucket-level permissions (object-level CRUD only) — `gcsfs`'s existence check (`fs.makedirs`) needs `roles/storage.legacyBucketReader` too, or it fails with `FileNotFoundError: Bucket does not exist` even though the bucket is right there. Same not-found-instead-of-denied error shape Secret Manager showed for a permission gap earlier in the week.
-6. `google_service_account.account_id` has a hard 30-character limit, and GCS bucket names have a 63-character limit — naive `${app_name}-${environment}-<suffix>` naming (with `app_name = "customer-support-rag"`, 21 characters) blew past both. Shortened the deployer SA suffix (`-deploy` → `-cd`) and dropped the redundant `app_name` from the bucket name (`project_id` alone already guarantees global uniqueness).
-7. Cloud Run's `deletion_protection` defaults to `true` and blocks even a legitimate destroy-and-replace of a tainted resource *within the same apply* — the check runs against the resource's prior state, not the updated config, so setting `deletion_protection = false` and replacing in one apply doesn't work; had to `terraform untaint` first (or, when that also failed, delete the broken resource directly). Set explicitly to `false` going forward since Terraform is the sole owner here.
-8. `INGEST_LEGACY_CSV=true` silently ingested nothing — `_load_legacy_csv_documents()` checks `os.path.exists()` and returns `[]` if missing, no error. Assumed the demo CSV was "already baked into the image" without verifying; the Dockerfile never copied `data/` at all. Added a targeted `COPY data/flipkart_product_review.csv` (not the whole `data/` dir, which also holds local per-environment ingestion state that shouldn't be baked into a shared image).
-9. Behind Cloud Run's TLS-terminating proxy, `uvicorn` needs `--proxy-headers --forwarded-allow-ips='*'`, or `url_for()`-generated URLs come back `http://` on an `https://` page — browsers block that as mixed content. Broke the chat UI's own `style.css` (Starlette-generated URL) while external CDN assets (Bootstrap/FontAwesome, already hardcoded `https://`) kept loading fine — the app looked "distorted": raw Bootstrap structure, none of the app's own styling.
-
-All fixed and verified via the same tight loop each time: push → PR → CI green → merge → watch the real Cloud Run/GitHub Actions logs → diagnose the *actual* error (not a guess) → fix → repeat. Two required explicit human sign-off before applying (an IAM role grant, and a Terraform apply) per the project's standing "confirm before consequential infra changes" practice.
+Every feature described in this document has been live-verified against this deployed service, not just locally — including real thumbs-up feedback producing a real Langfuse score, a real comparison query retrieving both products, and a real prompt-injection attempt being blocked with zero LLM calls. `test`/`prod` are not yet applied (see §21).
 
 ---
 
-## 13. Recent hardening (2026-07-14)
-
-A single day's live-testing session surfaced and fixed six distinct issues, in the order found:
-
-1. **Semantic cache negation risk** — raw cosine similarity ranked negated-opposite questions above genuine paraphrases. Fixed with the NLI entailment gate (§11.4).
-2. **Query-rewrite negation flip** — "do they sound bad?" got rewritten to "...good?" when prior chat history leaned positive. Fixed with an explicit polarity-preservation instruction + worked example in the rewrite prompt.
-3. **Three separate per-request reconstruction bugs** — embeddings, LLM clients, and the Langfuse client were all being rebuilt from scratch on every single request instead of cached. Fixed via instance-level and module-level singletons. ~4x warm-request latency improvement.
-4. **Sticky refusal caching** — a transient citation/groundedness failure got cached and kept refusing a genuinely answerable question for the full TTL window. Fixed by never caching a refusal answer.
-5. **Incomplete recall** — "which ones did you just mention?" after a 3-item answer recalled only 1 item. Fixed with an explicit completeness instruction in the generation prompt.
-6. **Ambiguous singular reference** — "tell me more about it" after listing 3 distinct products silently narrowed to the last one mentioned. Fixed in the rewrite prompt to expand to all named items — which in turn surfaced issue #14 below (parked, not yet fixed).
-
-All changes are covered by the existing 82-test suite (all passing) plus 3 new/updated tests specifically covering the NLI-gate negation-rejection behavior.
-
----
-
-## 14. Known limitations / parked work
-
-- **Multi-item retrieval dilution** (found 2026-07-14, parked). Once a follow-up correctly expands to "tell me more about X, Y, and Z," a single combined retrieval query dilutes precision per item — the embedding for "X and Y and Z" retrieves well for whichever product dominates semantically, weakly for the others. The system's own citation/groundedness guardrails correctly refuse to fabricate on the under-retrieved items (safe failure mode) rather than hallucinate, but the answer is incomplete. A real fix means running a separate retrieval pass per named item and merging contexts — genuine architecture work, not a prompt tweak.
-- **The web UI has no per-browser session ID.** `templates/chat.html` never sends `X-Session-Id`, so every browser tab defaults to `session_id="default"` server-side — concurrent web UI users currently share one global conversation. The API-level session isolation works correctly; the UI just doesn't exercise it.
-- **Metadata filters for `price`/`category`/`brand` don't match anything** against the bundled demo dataset (the CSV only has `product_title`/`rating`/`summary`/`review`). `rating>=N` does work. This means the LLM occasionally answers from tangentially-related context on out-of-scope filter questions instead of refusing — correct grounded behavior given what's actually available, just not what a filter query implies.
-- **`test`/`prod` Cloud Run environments are written but not yet applied.** `dev` is live and verified (see §12.1) — `terraform validate`/`apply` both work cleanly for `test`/`prod` too (same module code, now bug-fixed), but neither has been applied yet, and their GitHub Environment variables aren't configured. No Redis instance has been reprovisioned for any environment (see the `networking` module note in §12/`infra/README.md`).
-
----
-
-## 15. Testing & evaluation
-
-- **`tests/`** — 82 tests, unittest-based, run via `python -m unittest discover tests -p "test_*.py" -v` or `pytest`. All fast and dependency-free (using `fakeredis` for real-Redis-semantics testing without a network dependency, and mocked LLM/NLI calls) except `test_phase4_ci.py`, which instantiates a real `Retriever()` and calls real providers — consumes live quota when run.
-- **`evaluation/`** — a 12-case golden test set (`golden_test_set.py`) spanning recommendation, comparison, metadata-filter, out-of-scope, multi-turn, and prompt-injection cases. `evaluator.py` computes retrieval metrics (precision/recall/MRR) and generation metrics (faithfulness/relevance) — via RAGAS if installed and a reference answer is supplied, else a fast token-overlap fallback that still exercises the real production `_judge_groundedness` function (wired through by `run_evaluation.py`, not a weaker proxy). `run_evaluation.py` runs the full set end-to-end, writes `results.json`, and exits non-zero on regression vs. `baseline_results.json` — this is what gates the `evaluation.yml` CI workflow.
-
----
-
-## 16. Best practices followed (checklist)
+## 19. Best practices followed (checklist)
 
 **Correctness / safety**
-- ✅ Refuse rather than guess — citation check + LLM groundedness judge, both independent, either failing triggers a fixed safe-refusal string, never the model's raw (possibly wrong) output.
-- ✅ Never cache a refusal — avoids amplifying a transient failure into a sticky wrong answer for the whole cache TTL.
-- ✅ Semantic similarity gated by NLI entailment, not raw cosine — closes a real negation-confusion vulnerability rather than just tuning a threshold that couldn't actually solve it.
-- ✅ Prompt-injection defense — retrieved content is explicitly wrapped and labeled as untrusted data, never instructions, directly in the generation prompt.
-- ✅ `temperature=0` for reproducible answers to repeated questions.
-- ✅ Timing-safe API key comparison (`secrets.compare_digest`), fails closed if the key is unconfigured.
+- ✅ Refuse rather than guess — citation check + LLM groundedness judge, both independent.
+- ✅ Never cache a refusal.
+- ✅ Semantic similarity gated by NLI entailment, not raw cosine.
+- ✅ Prompt-injection defense on **both** channels — retrieved content (delimited, labeled untrusted) and the user's own message (pattern-matched, blocked pre-retrieval).
+- ✅ `temperature=0` for reproducible answers.
+- ✅ Timing-safe API key comparison, fails closed if unconfigured.
+- ✅ Multi-hop retrieval for comparison questions instead of one query that silently favors one product.
+
+**Privacy / compliance**
+- ✅ PII redaction (regex + NER) at ingestion and at the observability boundary — a hard dependency, not an optional install that can silently go missing.
+- ✅ LLM-generated content sanitized (DOMPurify) before DOM injection in the web UI.
+- ⚠️ No retention/TTL policy on Langfuse trace data itself (a Langfuse Cloud dashboard/plan setting, not something this repo controls) — see §21.
 
 **Reliability / degradation**
-- ✅ Every external dependency (Redis, Cohere, Langfuse, Chroma Cloud) has a defined fallback behavior, and every fallback is **logged loudly**, never silent.
-- ✅ Chroma: once cloud is configured, no silent fallback to a divergent local store on error — fails loud instead.
-- ✅ Ingestion state persisted after every batch (not just at the end), so a transient failure mid-run only costs a retry of what's left, not a full re-run/re-bill.
-- ✅ Incremental, idempotent ingestion (content-hash dedupe) — safe to re-run.
+- ✅ Every external dependency (Redis, Cohere, Langfuse, Chroma Cloud) has a defined, loudly-logged fallback.
+- ✅ Chroma: no silent fallback to a divergent local store on error.
+- ✅ Incremental, idempotent ingestion (file fingerprint + content-hash dedupe), now with an archive step so landing only ever holds unprocessed files.
 
 **Performance**
-- ✅ Dense + sparse retrieval run concurrently (`ThreadPoolExecutor`), not sequentially.
-- ✅ Expensive client objects (embedding model, LLM clients, NLI model, Langfuse client) are singletons, not reconstructed per request — found and fixed a ~4x latency regression from this exact anti-pattern in three separate places.
-- ✅ Reranker candidate pool sized differently depending on whether a real semantic reranker is active (wider) vs. the lexical fallback (narrower, to avoid degrading further).
+- ✅ Dense + sparse retrieval run concurrently, including per-product legs in the multi-hop path.
+- ✅ Expensive client objects are singletons.
+- ✅ Injection-blocked requests skip retrieval/LLM entirely — a security control that's also a latency/cost win.
 
-**Observability**
-- ✅ Structured JSON request tracing (`RequestTrace`) on every request — not just eval runs — covering retrieval/generation latency, cache hit type, citation/groundedness verdicts.
-- ✅ Langfuse traces cross-referenceable to log lines via a deterministic trace ID derived from the request ID.
-- ✅ citation_check/groundedness recorded as first-class Langfuse **scores**, not buried in metadata — directly chartable as production trend lines.
+**Observability & measurement**
+- ✅ Structured JSON request tracing plus Langfuse spans on every request, cross-referenceable by a deterministic trace ID.
+- ✅ Per-LLM-call cost tracking (model + token usage) as Langfuse generation observations — not just a top-level span.
+- ✅ A real outcome signal (thumbs up/down) and live product metrics (auto-resolution/exclusion/CSAT), not just technical-tier signals.
+- ✅ A/B testing infrastructure reusing existing Langfuse data, no bespoke platform.
 
 **Engineering hygiene**
 - ✅ Provider abstraction (LLM + embeddings) behind one loader, config-driven, env-override for fast incident response.
-- ✅ Comprehensive, fast, dependency-free test suite (82 tests) using `fakeredis` and mocks to validate real command semantics without live network calls.
-- ✅ Non-root Docker user, CPU-only PyTorch wheel to avoid shipping dead CUDA weight.
-- ✅ Workload Identity Federation for CI/CD — no long-lived GCP service account keys stored in GitHub.
+- ✅ Comprehensive, fast, dependency-free test suite (155 tests).
+- ✅ Every non-trivial feature added this session was live-verified against the actual deployed service, not just locally or via mocks — this caught a real SSE framing bug, a real API-shape bug in the Langfuse scores endpoint, and the Langfuse-never-installed deployment bug, none of which unit tests alone would have surfaced.
+- ✅ Non-root Docker user, CPU-only PyTorch wheel.
+- ✅ Workload Identity Federation for CI/CD — no long-lived GCP service account keys in GitHub.
+
+---
+
+## 20. Recent hardening (2026-07-16)
+
+A single extended session working through a self-authored architecture critique, tier by tier, each item implemented, tested, deployed, and live-verified against the real service before moving to the next:
+
+1. **Redis wiring** — designed since an earlier session but never actually deployed; now live in `dev` (§18.1).
+2. **Ingestion archive step** — landing → processed → archive pattern, replacing the demo CSV baked into the Docker image.
+3. **CSV embedding content fix** — product name/rating/summary now embedded alongside review text, not review-only (§12.2). Required a full Chroma collection wipe + re-ingest.
+4. **Langfuse cost tracking** — per-LLM-call `generation` observations with model + token usage (§14).
+5. **PII redaction** — regex + Presidio/spaCy NER, at ingestion and the Langfuse boundary (§13).
+6. **Two deployment bugs found via live verification, not inspection**: `langfuse` and `redis` were both only in `requirements-optional.txt`, silently never installed in the deployed image (§18.1, §18.2).
+7. **Chat Markdown formatting** — plus a real, pre-existing SSE framing bug (an embedded newline in a streamed token silently truncated everything after it) found and fixed as a direct consequence of fixing the prompt to actually produce multi-line Markdown.
+8. **User-outcome signal** — `POST /feedback`, thumbs up/down as a Langfuse score (§16).
+9. **Multi-hop comparison retrieval** — LLM-classified comparison intent, one retrieval leg per product (§8).
+10. **Product/business metrics** — `evaluation/product_metrics.py`, live-traffic auto-resolution/exclusion/CSAT (§16). Caught a real API-shape bug doing so (the traces list endpoint returns score IDs, not full score objects, unlike the trace detail endpoint).
+11. **A/B testing** — variant-tagged Langfuse traces, no bespoke framework (§17).
+12. **Input-side prompt-injection guard** — pattern-based, blocks before retrieval (§15).
+
+Every item above was live-verified against the actual deployed `dev` service (not just local/mocked), which is what caught items 6, 7's SSE bug, and 10's API-shape bug — none of which the existing unit test suite alone would have surfaced.
+
+For the 2026-07-14 hardening pass (semantic cache negation fix, query-rewrite negation-preservation, client-object caching, sticky-refusal-cache fix, multi-item recall, ambiguous-reference expansion) and the 2026-07-15 Cloud Run migration, see git history — this document no longer carries their full detail inline to keep pace with the current architecture, but none of those fixes were reverted or superseded.
+
+---
+
+## 21. Known limitations / not accomplished
+
+Deliberately left undone, each for a stated reason — not oversights:
+
+- **Ingestion scale-out** (vectorized CSV parsing, parallel upserts, or a move to Spark/Databricks) — the current `pandas.read_csv` + `df.iterrows()` + sequential-upsert implementation (§12.4) would not hold up at millions of documents, but there is no real volume number driving that yet. Building for scale that doesn't exist is speculative work with no way to validate it solves the right problem.
+- **SOC2 controls** (per-client API identities instead of one shared static key, formal audit logging, a data inventory document) — genuinely buildable, but "SOC2 controls" implies an actual audit scope, timeline, and compliance decision that's a business call, not something to infer and build toward blind.
+- **HIPAA compliance** — deliberately skipped. No health data anywhere in this domain (e-commerce product reviews) unless the product roadmap changes.
+- **Langfuse trace data retention/TTL policy** — PII redaction (§13) reduces what's stored, but there is still no retention window on Langfuse Cloud's side, unlike `SessionStore`'s explicit 24h TTL. This is a dashboard/plan-level setting on Langfuse's platform, not something this repo's code controls.
+- **A latent concurrency bug, found but not fixed**: `main.py`'s `retriever_obj.last_standalone_query` is a shared module-level instance attribute. Under concurrent requests, one request can read back another's value before it's logged, corrupting the `standalone_query` field in that request's trace/log line specifically. Cosmetic/observability-only — the actual retrieval and generation for each request stay correct, only the logged rewritten-query text can be wrong. Caught by chance because an automated process was hitting the deployed service repeatedly during testing.
+- **The web UI still has no per-browser session ID.** `templates/chat.html` never sends `X-Session-Id`, so every browser tab defaults to `session_id="default"` server-side — concurrent web UI users share one global conversation. Unchanged from before this session; the API-level session isolation works correctly, the UI just doesn't exercise it.
+- **Metadata filters for `price`/`category`/`brand`** still don't match anything against the bundled demo dataset (only `rating` does) — unchanged from before this session.
+- **`test`/`prod` Cloud Run environments** are written and `terraform validate`-clean but not yet applied. No Redis instance has been reprovisioned for either.
+- **Complexity-based LLM routing** (simple lookup → small/cheap model, comparison → larger model) — the comparison classifier built for multi-hop retrieval (§8.2) is the natural place to add this as a byproduct, but it wasn't built as part of that work; A/B testing's model-override mechanism (§17) is a related but distinct capability (a fixed experiment split, not per-query complexity routing).
+
+---
+
+## 22. Testing & evaluation
+
+- **`tests/`** — 155 tests, unittest-based, run via `python -m unittest discover tests -p "test_*.py" -v` or `pytest`. All fast and dependency-free (`fakeredis`, mocked LLM/NLI/Langfuse calls) except `test_phase4_ci.py`, which hits real providers.
+- **`evaluation/`** — two complementary evaluation paths:
+  - **Offline, technical-tier**: `golden_test_set.py` (12 labeled cases) + `evaluator.py` (RAGAS or fallback) + `run_evaluation.py` (gates CI on regression vs. baseline).
+  - **Live, product-tier**: `product_metrics.py` (§16) — no fixed test set, aggregates real traffic from Langfuse, run on demand or on a schedule.

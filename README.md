@@ -2,9 +2,14 @@
 
 A FastAPI-based ecommerce product assistant: hybrid (dense + BM25) retrieval
 over a Chroma vector store, optional Cohere semantic reranking, conversational
-query rewriting for multi-turn chat, and grounded generation with citation
-verification and an LLM groundedness judge. LLM and embedding providers are
-swappable (Groq / Google Gemini / HuggingFace) via `config/config.yaml`.
+query rewriting for multi-turn chat, multi-hop retrieval for product
+comparisons, and grounded generation with citation verification and an LLM
+groundedness judge. LLM and embedding providers are swappable (Groq / Google
+Gemini / HuggingFace) via `config/config.yaml`. Also covers PII redaction,
+input-side prompt-injection defense, per-request cost tracking, a real
+user-outcome signal (thumbs up/down), live product metrics, and A/B testing --
+see [`APP_SUMMARY.md`](APP_SUMMARY.md) for the full HLD/LLD writeup, including
+what's explicitly **not** done yet.
 
 ## Architecture
 
@@ -13,8 +18,10 @@ User (web UI or API client)
         |
         v
 FastAPI (main.py)
-  - X-API-Key auth on /get, /get/stream
+  - X-API-Key auth on /get, /get/stream, /feedback
   - per-identity rate limiting
+  - prompt-injection pattern check on the raw message (blocks before
+    retrieval/LLM calls entirely if a jailbreak/override attempt is detected)
   - exact + semantic response cache
         |
         v
@@ -22,6 +29,12 @@ Query contextualization (retriever/query_rewriter.py)
   - resolves follow-ups ("what about a cheaper one?") into a standalone
     query using chat history, via a small/fast LLM
   - skipped entirely on a session's first turn
+        |
+        v
+Comparison-intent classification (retriever/query_rewriter.py)
+  - detects "compare X and Y"-style questions naming 2+ products
+  - comparison -> one hybrid-search leg per product, product-filtered
+  - otherwise -> the normal single-query path below
         |
         v
 Hybrid retrieval (retriever/retrieval.py)
@@ -38,7 +51,11 @@ Reranking
 Generation (prompt_library/prompt.py + utils/model_loader.py)
   - context chunks delimited in <doc source="..."> tags (prompt-injection
     defense: model is told to treat them as data, not instructions)
+  - product_bot, or product_comparison_bot for a detected comparison
+    (asks for a Markdown comparison table)
   - citation required in [source:ID] form
+  - model may be A/B-overridden for a session bucketed into "treatment"
+    (off by default, see Configuration)
         |
         v
 Guardrails
@@ -47,7 +64,13 @@ Guardrails
   - either failing -> safe "Insufficient context" fallback, not a guess
         |
         v
-Response to user + session history persisted (Redis-backed, in-memory fallback)
+Response to user (Markdown-rendered) + session history persisted
+(Redis-backed, in-memory fallback) + PII-redacted Langfuse trace, with
+per-LLM-call cost tracking
+        |
+        v
+Optional: thumbs up/down -> POST /feedback -> Langfuse score on the same
+trace -> evaluation/product_metrics.py aggregates live product metrics
 ```
 
 ## Project structure
@@ -56,29 +79,45 @@ Response to user + session history persisted (Redis-backed, in-memory fallback)
 main.py                      FastAPI app: routes, auth, caching, the request pipeline
 config/config.yaml           Model providers, retrieval, ingestion settings
 retriever/
-  retrieval.py                Hybrid search, RRF, reranking, metadata filters
-  query_rewriter.py           Multi-turn query contextualization
+  retrieval.py                Hybrid search, RRF, reranking, metadata filters,
+                               multi-hop comparison routing
+  query_rewriter.py           Multi-turn query contextualization + comparison-intent
+                               classification
 data_ingestion/
-  ingestion_pipeline.py        Incremental ingest: land -> clean -> chunk -> dedupe -> embed
+  ingestion_pipeline.py        Incremental ingest: land -> clean -> PII-redact -> chunk ->
+                                dedupe -> embed -> archive
 utils/
   model_loader.py              LLM/embedding provider loading (groq/google/huggingface)
   chroma_utils.py               Chroma Cloud vs local persistence routing
   ops.py                        ResponseCache, RateLimiter, SessionStore (Redis-backed,
-                                 in-memory fallback), request tracing
+                                 in-memory fallback), request tracing, Langfuse wiring
+                                 (trace + per-call cost tracking + feedback scores),
+                                 A/B variant assignment
+  pii.py                        PII redaction: regex + Presidio/spaCy NER
+  prompt_guard.py                Input-side prompt-injection/jailbreak pattern detection
   bm25_index.py, object_store.py, config_loader.py
-prompt_library/prompt.py      System prompts (generation, groundedness judge, query rewrite)
+prompt_library/prompt.py      System prompts (generation, comparison generation,
+                               groundedness judge, query rewrite, comparison classifier)
 evaluation/
   golden_test_set.py           12-case labeled test set across recommendation, comparison,
                                 metadata-filter, out-of-scope, multi-turn, and prompt-injection cases
   evaluator.py                  Retrieval (precision/recall/MRR) + generation (faithfulness/
                                  relevance) metrics; uses RAGAS if installed, else a fast fallback
   run_evaluation.py             Runs the golden set end-to-end, gates CI on regression vs. baseline
-tests/                        70 tests: fast unit tests (no live deps) + a few CI-only
+  product_metrics.py            Live-traffic product metrics from real Langfuse data
+                                 (auto-resolution rate, exclusion rate, CSAT proxy),
+                                 optional --by-variant A/B breakdown
+tests/                        155 tests: fast unit tests (no live deps) + a few CI-only
                                live tests (test_phase4_ci.py) that hit real providers
-templates/, static/           Web chat UI
-deploy/k8s.yaml, Dockerfile,
-docker-compose.yml             Deployment manifests (not covered in depth here)
+templates/, static/           Web chat UI -- Markdown-rendered answers (marked.js +
+                               DOMPurify), thumbs up/down feedback buttons
+infra/, Dockerfile,
+docker-compose.yml             Terraform (GCP Cloud Run) + container build -- see
+                                infra/README.md and APP_SUMMARY.md §18 for deployment detail
 ```
+
+See [`APP_SUMMARY.md`](APP_SUMMARY.md) for the full Low-Level Design writeup of
+every module above (§6-§17).
 
 ## Prerequisites
 
@@ -105,19 +144,25 @@ cp .env.example .env
 # edit .env: APP_API_KEY, one LLM provider's key, CHROMA_API_KEY/TENANT/DATABASE
 ```
 
-Ingest the bundled demo dataset (450 Flipkart product reviews) into your
-Chroma collection -- one-time, safe to re-run (incremental, deduped by
-content hash):
+Put the bundled demo dataset (Flipkart product reviews CSV) in whatever path
+`LANDING_PATH` points at (see `.env.example`; defaults to a local `data/landing`
+folder), then ingest it into your Chroma collection -- one-time, safe to
+re-run (incremental, deduped by content hash at the file level and the chunk
+level):
 
 ```bash
-INGEST_LEGACY_CSV=true python -m data_ingestion.ingestion_pipeline
+python -m data_ingestion.ingestion_pipeline
 ```
 
 This populates whatever collection `config/config.yaml`'s `chroma.collection_name`
 points at, using whatever `embedding_model` is configured. **If you change
 the embedding provider/model later, you must re-ingest into a new collection
 name** -- different embedding models produce different vector spaces and
-can't share a collection.
+can't share a collection. Each chunk's embedded text includes labeled
+`Product`/`Rating`/`Summary`/`Review` fields (not review text alone), and
+source text is PII-redacted before embedding. Successfully processed files
+are moved to `ARCHIVE_PATH` afterward, so re-running only ever picks up
+genuinely new files.
 
 ## Running it yourself
 
@@ -156,6 +201,18 @@ curl -N -X POST http://localhost:8001/get/stream \
   -H "X-API-Key: $APP_API_KEY" \
   -H "X-Session-Id: user-123" \
   --data-urlencode "msg=What do people say about the realme Buds Q?"
+
+# comparison question -- retrieves each named product separately
+curl -X POST http://localhost:8001/get \
+  -H "X-API-Key: $APP_API_KEY" \
+  -H "X-Session-Id: user-123" \
+  --data-urlencode "msg=Compare the battery life of the Boat Rockerz 235v2 and the realme Buds Q"
+
+# feedback on a prior answer -- grab request_id from the SSE "request_id"
+# event, or from invoke_chain_details's response dict when calling directly
+curl -X POST http://localhost:8001/feedback \
+  -H "X-API-Key: $APP_API_KEY" -H "Content-Type: application/json" \
+  -d '{"request_id": "<uuid from the original request>", "rating": "up"}'
 ```
 
 ```python
@@ -182,9 +239,23 @@ print(ask("Do they have noise cancellation?", session_id="user-1"))  # multi-tur
 python -m unittest discover tests -p "test_*.py" -v
 ```
 
-70 tests, all fast and dependency-free except `tests/test_phase4_ci.py`,
+155 tests, all fast and dependency-free except `tests/test_phase4_ci.py`,
 which instantiates a real `Retriever()` and calls real providers -- expect
 that one to consume LLM/Chroma/Cohere quota when you run it.
+
+### Running the live product metrics
+
+```bash
+python -m evaluation.product_metrics --hours 24
+python -m evaluation.product_metrics --hours 24 --by-variant   # A/B breakdown
+```
+
+Aggregates real Langfuse trace/score data from the last N hours into
+auto-resolution rate, exclusion rate, active users, and a CSAT proxy (thumbs
+up ratio) -- no new instrumentation, no fixed test set. Requires
+`LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` to be set and to already have
+live traffic to aggregate. This is the live-traffic counterpart to the golden
+set below.
 
 ### Running the evaluation framework
 
@@ -259,8 +330,12 @@ query so degraded mode is never silent.
 `REDIS_URL` backs three independent things in `utils/ops.py`:
 `SessionStore` (per-session chat history), `ResponseCache` (exact + semantic
 answer caching), and `RateLimiter`. All three fall back to an in-memory
-equivalent when `REDIS_URL` is unset, logged loudly when that happens. The
-in-memory fallback is correct for a single local process, but:
+equivalent when `REDIS_URL` is unset, logged loudly when that happens.
+**As of 2026-07-16 this is genuinely wired and live-verified in the `dev`
+deployment** (Memorystore Basic tier + a VPC connector, see
+`infra/modules/gcp/networking`) -- previously it was designed and unit-tested
+but never actually deployed. The in-memory fallback is still correct for a
+single local process, but:
 
 - multi-turn chat history only stays consistent as long as the same
   process/replica keeps handling that session -- silently breaks under
@@ -281,7 +356,7 @@ external service: `python -m unittest tests.test_redis_backed -v` (uses
 `fakeredis`, an in-process Redis-protocol implementation -- validates real
 Redis command semantics, no network involved).
 
-### Production monitoring (Langfuse)
+### Production monitoring and cost tracking (Langfuse)
 
 Every single request -- not just eval runs -- already computes a hallucination
 signal per `main.py`'s `invoke_chain_details`: `citation_check` (did the
@@ -290,36 +365,85 @@ answer cite a source_id that wasn't actually retrieved?) and
 the retrieved context?), plus retrieval/generation latency and cache hit
 type. Setting `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` in `.env` sends all
 of that to [Langfuse](https://langfuse.com) (free Cloud tier or self-hosted)
-as a proper per-request trace, with `citation_check` and `groundedness`
-recorded as first-class Langfuse **scores** -- not just metadata -- so
-they're directly chartable in the Langfuse dashboard as trend lines (e.g.
-"groundedness pass rate over the last 7 days"). That trend is the actual
-answer to "is the app's quality degrading in production": a citation/
-groundedness pass-rate that's drifting down is the hallucination-rate signal,
-observable without waiting for the next `evaluation/run_evaluation.py` run.
+as a proper per-request trace, with `citation_check`, `groundedness`, and
+(if the user gives feedback) `user_feedback` recorded as first-class Langfuse
+**scores** -- not just metadata -- so they're directly chartable in the
+Langfuse dashboard as trend lines (e.g. "groundedness pass rate over the last
+7 days"). That trend is the actual answer to "is the app's quality degrading
+in production": a citation/groundedness pass-rate that's drifting down is the
+hallucination-rate signal, observable without waiting for the next
+`evaluation/run_evaluation.py` run.
+
+Every LLM call within a request (query rewrite, comparison classification,
+answer generation, groundedness judge) is *also* tracked as its own nested
+Langfuse **generation** observation, tagged with the actual model name and
+token usage -- this is what makes Langfuse's cost dashboard compute real
+per-model/per-step cost, not just a request count. Traces are also tagged
+with the session's A/B `experiment_variant` (see below), and all trace/
+generation input-output text is PII-redacted (`utils/pii.py`) before it's
+sent to Langfuse.
 
 Each trace's ID is deterministically derived from the request's own
 `request_id` (`Langfuse.create_trace_id(seed=request_id)`), so a Langfuse
 trace can always be cross-referenced back to the matching `RequestTrace` JSON
 log line (see the "Structured request tracing" known limitation below --
 you need `logging.basicConfig()` configured for that log line to actually go
-anywhere).
+anywhere), and `POST /feedback` re-derives the same trace ID from `request_id`
+to attach a score after the fact, with no separate storage needed.
 
 `utils/ops.py`'s `build_langfuse_trace`/`finish_langfuse_trace` use the
-OpenTelemetry-based span API from the Langfuse **v3+** SDK
-(`requirements-optional.txt` pins `langfuse>=3,<5`) -- the older `.trace()`
-call this replaced was removed in that rewrite and would silently no-op
-(caught by a broad `except`, span always `None`, nothing ever reaching the
-dashboard) on any modern `pip install langfuse`. Both helpers are fully
-optional: unset the two keys and every call becomes a no-op, same as today.
+OpenTelemetry-based span API from the Langfuse **v4** SDK. `langfuse` is a
+**hard** dependency in `requirements.txt` (moved there this session after
+being found only in `requirements-optional.txt`, which the deployed Docker
+image never installed -- tracing was silently a no-op in production for a
+while as a result). Both helpers are still fully optional at the config
+level: unset the two keys and every call becomes a no-op.
+
+### PII redaction
+
+`utils/pii.py`'s `redact_pii()` runs regex-based redaction (email/phone/card)
+plus NER (Presidio + spaCy's `en_core_web_sm`, for names/locations) at two
+points: on source documents during ingestion (§ above), and on every
+trace/generation's input-output text right before it's sent to Langfuse. The
+LLM itself still sees real, unredacted text -- redaction targets the specific
+point data would otherwise leave the process to a third-party tool. This is
+a hard dependency (not optional-install) on purpose: a security control that
+can silently disappear because of a missing pip install is worse than not
+having the feature at all.
+
+### Prompt-injection defense
+
+Two independent channels. Retrieved review content has always been
+delimited (`<doc source="...">` tags) and the generation prompt explicitly
+told to treat it as data, never instructions -- backed by the citation check
+and groundedness judge, which reject an answer regardless of what the model
+claims. As of this session, the user's own chat message is *also* checked
+(`utils/prompt_guard.py`'s `detect_prompt_injection`) against five jailbreak/
+override pattern categories before retrieval or any LLM call runs at all --
+instruction override, system-prompt leak, role override ("act as DAN"),
+developer-mode requests, and fake role markers. A match short-circuits with
+a fixed refusal; see `tests/test_prompt_guard.py` for the exact patterns and
+the deliberate false-positive test cases (ordinary questions containing
+words like "ignore"/"system"/"act as").
+
+### A/B testing
+
+Off by default. Set `AB_TEST_ENABLED=true` and `AB_TEST_MODEL_NAME=<model>`
+to route sessions deterministically bucketed into `"treatment"`
+(`utils/ops.py`'s `assign_experiment_variant`, a stable hash of `session_id`)
+to a different model for the main answer-generation call only. Every trace
+is tagged with its variant regardless of whether the experiment is active,
+so `python -m evaluation.product_metrics --by-variant` always has data to
+group by once you turn it on.
 
 ### Other env vars
 
 See `.env.example` for the full list with inline explanations: `CACHE_ENABLED`/
 `CACHE_TTL_SECONDS`/`SEMANTIC_CACHE_THRESHOLD`, `RATE_LIMIT_REQUESTS`/
 `RATE_LIMIT_WINDOW_SECONDS`, `SESSION_TTL_SECONDS`/`SESSION_MAX_TURNS`,
-`CHROMA_STORAGE_MODE`, and `LANDING_PATH`/`INDEX_PATH` (ingestion source/state
-location -- can point at `gs://`/`s3://`/`abfs://` in prod).
+`CHROMA_STORAGE_MODE`, `LANDING_PATH`/`ARCHIVE_PATH`/`INDEX_PATH` (ingestion
+source/archive/state location -- can point at `gs://`/`s3://`/`abfs://` in
+prod), and `AB_TEST_ENABLED`/`AB_TEST_MODEL_NAME` (above).
 
 ## Known limitations
 
@@ -328,7 +452,8 @@ location -- can point at `gs://`/`s3://`/`abfs://` in prod).
   `session_id="default"` on the server -- concurrent web UI users currently
   share one global conversation history. The API-level session isolation
   (via the `X-Session-Id` header, used throughout the examples above) works
-  correctly; the UI just doesn't exercise it yet.
+  correctly; the UI just doesn't exercise it yet. Unchanged by this session's
+  work.
 - **Structured request tracing doesn't surface in a real run.** `utils/ops.py`'s
   `RequestTrace` logs a JSON event per request (retrieval/generation latency,
   citation check, groundedness verdict, cache hit type) via `logging`, but
@@ -346,7 +471,35 @@ location -- can point at `gs://`/`s3://`/`abfs://` in prod).
     of refusing, on out-of-scope questions specifically.
 - **`llm.provider: "groq"`'s daily quota and `"google"`'s billing trap are
   both real, encountered firsthand** -- see the Configuration table above
-  before picking a provider for anything beyond light local testing.
+  before picking a provider for anything beyond light local testing. Groq's
+  daily cap was fully exhausted during this session's testing; the deployed
+  `dev` service currently runs on HuggingFace as a result.
+- **A known, unfixed concurrency bug**: `main.py`'s
+  `retriever_obj.last_standalone_query` is a shared module-level attribute --
+  under concurrent requests, one request can read back another's value before
+  it's logged. Cosmetic/observability-only (only the logged rewritten-query
+  text can be wrong; actual retrieval/generation per request stay correct).
+- **No retention/TTL policy on Langfuse trace data.** PII redaction (above)
+  reduces what's stored, but there's no equivalent of `SessionStore`'s
+  explicit TTL on the Langfuse side -- that's a dashboard/plan-level setting
+  on Langfuse's own platform, not something this repo's code controls.
+
+### Deliberately not built (see `APP_SUMMARY.md` §21 for the full reasoning)
+
+- **Ingestion scale-out** (vectorized parsing, parallel upserts) -- the
+  current `pandas`+`iterrows()` implementation is adequate for the current
+  dataset size; not optimized against a volume number that doesn't exist yet.
+- **SOC2 controls** (per-client API identities, formal audit logging) and
+  **HIPAA compliance** -- both need an actual compliance/business decision
+  this repo can't infer on its own; HIPAA specifically doesn't apply to this
+  domain (no health data) unless the product roadmap changes.
+- **Complexity-based LLM routing** (cheap model for simple lookups, larger
+  model for comparisons) -- the comparison classifier built for multi-hop
+  retrieval is the natural place to add this, but it wasn't built as part of
+  that work. The A/B testing model-override is a related but distinct
+  capability (a fixed experiment split, not per-query routing).
+- **`test`/`prod` Cloud Run environments** -- Terraform is written and
+  validated but not yet applied; only `dev` is live.
 
 ## Deployment
 
@@ -374,7 +527,7 @@ landing/index storage.
 
 ### CI/CD
 
-- `ci-fast-tests.yml` -- the 82-test unit suite, every push/PR, no live API calls.
+- `ci-fast-tests.yml` -- the 155-test unit suite, every push/PR, no live API calls.
 - `cd-dev.yml` / `cd-test.yml` / `cd-prod.yml` -- branch-triggered: tests -> build (once;
   the same image is promoted across environments, never rebuilt per environment) ->
   deploy (runs the ingestion job, then the Cloud Run service, then a `/health`+`/ready`
@@ -429,6 +582,20 @@ Every one of these was an actual failure on the first real deploy, not a hypothe
   --forwarded-allow-ips='*'`, or `url_for()`-generated URLs come back `http://` on an
   `https://` page -- browsers block that as mixed content, breaking the chat UI's own
   stylesheet while external CDN assets kept loading fine.
+- `google_vpc_access_connector` names are capped at 25 characters, and the resource
+  needs explicit `min_instances`/`max_instances` now (the provider no longer defaults
+  them) -- both hit standing up the VPC connector for Redis.
+- **A dependency listed only in `requirements-optional.txt` is never installed in the
+  deployed image, and both `redis` and `langfuse` were caught in exactly this state** --
+  infra can be perfectly provisioned (a real Memorystore instance, a real Langfuse
+  project) and the app will still silently run on in-memory cache / no-op tracing,
+  because `utils/ops.py` fails soft on `ModuleNotFoundError` by design. Only live
+  verification against the deployed service caught this, not code review or unit tests.
+  Fixed by moving both to `requirements.txt` as hard dependencies.
+- **Cloud Run's Service and its ingestion Job are separate deployables with
+  independent container images.** Fixing and rebuilding one does not touch the other --
+  the first post-fix ingestion run silently archived nothing because the Job was still
+  running a stale image.
 
 ### Verified live
 
@@ -439,6 +606,8 @@ $ curl https://customer-support-rag-dev-udytqlhsma-uw.a.run.app/ready
 {"status":"ready","checks":{"app_api_key":true,"groq_api_key":true,"chroma_storage":true}}
 ```
 
-Real ingestion ran end to end (542 chunks from the bundled demo dataset into Chroma
-Cloud + the BM25 index), and a real query through the deployed app returned a
-correctly-grounded, cited answer -- not just health checks passing.
+Real ingestion ran end to end (bundled demo dataset into Chroma Cloud + the BM25
+index, with the product-context embedding fix and PII redaction applied), and every
+feature added this session -- multi-hop comparison retrieval, the prompt-injection
+guard, `POST /feedback` producing a real Langfuse score, Redis-backed sessions/cache --
+was live-verified against this deployed service, not just locally or via mocks.
