@@ -36,6 +36,17 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def _clean_field(value: Any) -> str:
+    """Stringify a CSV cell for embedding, dropping missing/NaN values
+    instead of literally embedding the text "nan"."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() == "nan" else text
+
+
 class DataIngestion:
     """Incremental ingestion job: landing storage (GCS/S3/ADLS/local) -> clean
     -> dedupe -> chunk -> upsert to the vector store -> update BM25 index.
@@ -176,7 +187,22 @@ class DataIngestion:
                 }
                 for optional_field in ("price", "category", "brand"):
                     metadata[optional_field] = row.get(optional_field) if optional_field in row.index else None
-                page_content = clean_text(str(row.get("review", "")))
+
+                # Embed product context alongside the review text itself --
+                # previously only the review was embedded, so a query naming
+                # the product ("How is Boat Rockerzz") only matched if a
+                # review happened to repeat those words. product_title/
+                # rating/summary were metadata-only, invisible to both dense
+                # and BM25 search (which both index off page_content).
+                labeled_fields = (
+                    ("Product", _clean_field(row.get("product_title"))),
+                    ("Rating", _clean_field(row.get("rating"))),
+                    ("Summary", _clean_field(row.get("summary"))),
+                    ("Review", _clean_field(row.get("review"))),
+                )
+                page_content = clean_text(
+                    "\n".join(f"{label}: {value}" for label, value in labeled_fields if value)
+                )
             else:
                 metadata = {
                     "source_row": int(index + 1),
