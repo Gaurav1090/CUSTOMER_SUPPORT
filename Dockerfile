@@ -16,12 +16,13 @@ COPY static ./static
 COPY templates ./templates
 COPY utils ./utils
 COPY main.py ./
-# Only the demo CSV -- not the rest of data/, which also holds local
-# per-environment ingestion state (.ingestion_state.json,
-# .keyword_index.json) that has no business being baked into the image.
-# Needed for INGEST_LEGACY_CSV=true (used by dev's ingestion job so it
-# has real data to test against instead of an empty landing bucket).
-COPY data/flipkart_product_review.csv ./data/flipkart_product_review.csv
+# Source data is NOT baked into the image -- it belongs in the GCS landing
+# bucket (see infra/modules/gcp/storage), uploaded independently of the
+# container so ingestion has no coupling to what image happens to be
+# deployed. Previously this COPY'd the demo CSV in directly (gated by
+# INGEST_LEGACY_CSV); that was a quick fix for dev's landing bucket
+# starting empty, replaced by uploading the demo CSV to the bucket instead
+# -- see infra/README.md's Redis/ingestion setup notes.
 
 RUN pip install --no-cache-dir --prefer-binary --no-compile -r requirements.txt && \
     # gcsfs: fsspec's gs:// backend, needed by utils/object_store.py for the
@@ -31,7 +32,16 @@ RUN pip install --no-cache-dir --prefer-binary --no-compile -r requirements.txt 
     # image *is* the GCP Cloud Run deployment artifact specifically, so it
     # always needs it. requirements-optional.txt has the other fsspec
     # backends (s3fs/adlfs) for if/when a non-GCP build is added.
-    pip install --no-cache-dir --prefer-binary --no-compile gcsfs
+    #
+    # redis: utils/ops.py's SessionStore/ResponseCache/RateLimiter all
+    # import this lazily and degrade to an in-memory fallback if it's
+    # missing -- which silently defeated the whole point of wiring up
+    # Memorystore (see infra/modules/gcp/networking) the first time this
+    # image was deployed without it. Same reasoning as gcsfs: install it
+    # explicitly here rather than pulling in all of requirements-optional.txt
+    # (which also has ragas/langfuse -- heavier, and not both verified
+    # working in this image yet).
+    pip install --no-cache-dir --prefer-binary --no-compile gcsfs redis
 
 RUN mkdir -p /app/chroma_db /app/data && \
     adduser --disabled-password --gecos "" appuser && \

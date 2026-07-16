@@ -64,6 +64,42 @@ echo -n "$VALUE" | gcloud secrets versions add customer-support-rag-dev-app-api-
 # and optionally cohere-api-key/langfuse-public-key/langfuse-secret-key
 ```
 
+### Redis (Memorystore)
+
+When `enable_vpc_connector = true` (set for `dev` -- see `environments/dev/main.tf`), `apply`
+provisions a Basic-tier Memorystore instance plus the Private Services Access peering it
+requires. Its host/port aren't known until after `apply`, so -- like every other secret --
+Terraform only creates the `redis-url` secret *container*; populate it manually:
+
+```bash
+terraform output -raw redis_url   # redis://<internal-ip>:<port>
+echo -n "redis://<internal-ip>:<port>" | gcloud secrets versions add customer-support-rag-dev-redis-url \
+  --project=project-0fbdbc8d-9379-4cfb-84a --data-file=-
+```
+
+`utils/ops.py`'s `SessionStore`/`ResponseCache`/`RateLimiter` all degrade to an in-memory
+fallback if `REDIS_URL` is unset or unreachable -- so a missing secret fails soft (each Cloud
+Run instance gets its own independent state, silently breaking multi-instance consistency)
+rather than hard. Confirm it's actually wired by checking Cloud Run logs for "Redis ... connected"
+on startup, not just that `terraform apply` succeeded.
+
+Memorystore Basic tier has an ongoing cost (~1GB instance, no HA) for as long as it exists --
+this is a real, billed resource, not something to `apply` casually in a throwaway environment.
+
+### Landing bucket seed data (dev)
+
+`dev`'s ingestion job now reads from the landing bucket like every other environment --
+the demo CSV is no longer baked into the image (`INGEST_LEGACY_CSV` was removed from
+`environments/dev/main.tf`). After the storage bucket exists, seed it once:
+
+```bash
+gcloud storage cp data/flipkart_product_review.csv \
+  gs://dev-ingestion-project-0fbdbc8d-9379-4cfb-84a/landing/flipkart_product_review.csv
+```
+
+The ingestion job archives it to `gs://<bucket>/archive/` after a successful run (see
+`data_ingestion/ingestion_pipeline.py`'s `_archive_files`), so this only needs doing once.
+
 ## Adding a second cloud provider
 
 `infra/environments/*/variables.tf`'s `cloud_provider` variable is the parameter point —
@@ -83,10 +119,10 @@ currently validated to only accept `"gcp"`. To add AWS or Azure:
 
 ## What's deliberately not here yet
 
-- **Redis / Memorystore**: no Redis instance exists (deleted along with the old GKE
-  cluster). `infra/modules/gcp/networking`'s Serverless VPC Access connector is present
-  but disabled (`enable_vpc_connector = false`) — flip it on and reprovision Memorystore
-  when session/cache persistence across Cloud Run instances is needed again.
+- **Redis / Memorystore in test/prod**: `enable_vpc_connector = true` is set for `dev`
+  only (`environments/dev/main.tf`) — `test`/`prod` still default to `false`, no
+  Memorystore instance, no VPC connector. Flip it on the same way once those
+  environments need session/cache persistence across instances too.
 - **Prod ingress hardening**: the Cloud Run service currently allows unauthenticated
   invocation at the infrastructure level (`allUsers` invoker) — real access is gated by
   `APP_API_KEY` at the HTTP layer (`main.py`'s auth middleware), matching the old GKE
