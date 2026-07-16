@@ -13,6 +13,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -28,6 +29,7 @@ from utils.ops import (
     finish_langfuse_trace,
     finish_llm_generation,
     new_request_id,
+    record_feedback_score,
     start_llm_generation,
 )
 from utils.pii import redact_pii
@@ -85,7 +87,7 @@ async def api_key_middleware(request: Request, call_next):
     request_id = request.headers.get("X-Request-Id", new_request_id())
     request.state.request_id = request_id
 
-    protected_paths = {"/get", "/get/stream"}
+    protected_paths = {"/get", "/get/stream", "/feedback"}
     if request.url.path in protected_paths and request.method != "OPTIONS":
         if not app_api_key:
             logger.error("APP_API_KEY is not configured.")
@@ -365,3 +367,17 @@ async def chat_stream(request: Request, msg: str = Form(..., min_length=1, max_l
         yield "event: done\ndata: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+class FeedbackRequest(BaseModel):
+    request_id: str
+    rating: str
+
+
+@app.post("/feedback")
+async def feedback(payload: FeedbackRequest):
+    if payload.rating not in ("up", "down"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="rating must be 'up' or 'down'.")
+
+    recorded = await anyio.to_thread.run_sync(lambda: record_feedback_score(payload.request_id, payload.rating))
+    return {"recorded": recorded}

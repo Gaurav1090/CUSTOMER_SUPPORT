@@ -1,10 +1,13 @@
+import os
 import unittest
+from unittest.mock import patch
 
 from utils.ops import (
     RequestTrace,
     build_langfuse_trace,
     finish_langfuse_trace,
     finish_llm_generation,
+    record_feedback_score,
     start_llm_generation,
 )
 
@@ -176,6 +179,66 @@ class LlmGenerationTrackingTests(unittest.TestCase):
         # Must not raise -- an observability backend hiccup must never
         # break the actual LLM call it's wrapping.
         finish_llm_generation(_BrokenGeneration(), "answer", {"input_tokens": 1})
+
+
+class _FakeLangfuseClient:
+    def __init__(self):
+        self.score_calls = []
+
+    def create_trace_id(self, *, seed):
+        return f"trace-for-{seed}"
+
+    def create_score(self, **kwargs):
+        self.score_calls.append(kwargs)
+
+
+class RecordFeedbackScoreTests(unittest.TestCase):
+    def setUp(self):
+        os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-test"
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-test"
+
+    def tearDown(self):
+        os.environ.pop("LANGFUSE_PUBLIC_KEY", None)
+        os.environ.pop("LANGFUSE_SECRET_KEY", None)
+
+    def test_returns_false_when_keys_unset(self):
+        os.environ.pop("LANGFUSE_PUBLIC_KEY", None)
+        os.environ.pop("LANGFUSE_SECRET_KEY", None)
+        self.assertFalse(record_feedback_score("req-1", "up"))
+
+    def test_records_thumbs_up_as_boolean_score_on_the_original_trace(self):
+        client = _FakeLangfuseClient()
+        with patch("utils.ops._get_langfuse_client", return_value=client):
+            result = record_feedback_score("req-1", "up")
+
+        self.assertTrue(result)
+        self.assertEqual(len(client.score_calls), 1)
+        call = client.score_calls[0]
+        self.assertEqual(call["name"], "user_feedback")
+        self.assertEqual(call["value"], 1.0)
+        self.assertEqual(call["trace_id"], "trace-for-req-1")
+        self.assertEqual(call["data_type"], "BOOLEAN")
+
+    def test_records_thumbs_down_as_zero(self):
+        client = _FakeLangfuseClient()
+        with patch("utils.ops._get_langfuse_client", return_value=client):
+            record_feedback_score("req-2", "down")
+
+        self.assertEqual(client.score_calls[0]["value"], 0.0)
+
+    def test_returns_false_when_client_is_unavailable(self):
+        with patch("utils.ops._get_langfuse_client", return_value=None):
+            self.assertFalse(record_feedback_score("req-1", "up"))
+
+    def test_swallows_exceptions_from_the_client_itself(self):
+        class _BrokenClient(_FakeLangfuseClient):
+            def create_score(self, **kwargs):
+                raise RuntimeError("langfuse is down")
+
+        # Must not raise -- an observability backend hiccup must never
+        # break the feedback endpoint's response to the user.
+        with patch("utils.ops._get_langfuse_client", return_value=_BrokenClient()):
+            self.assertFalse(record_feedback_score("req-1", "up"))
 
 
 if __name__ == "__main__":

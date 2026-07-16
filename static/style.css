@@ -136,6 +136,38 @@ body, html {
     max-width: 70%;
 }
 
+.feedback_row {
+    margin-top: 8px;
+    display: flex;
+    gap: 8px;
+}
+
+.feedback_btn {
+    background: none;
+    border: 1px solid rgba(0, 0, 0, 0.15);
+    border-radius: 12px;
+    padding: 2px 10px;
+    cursor: pointer;
+    color: rgba(0, 0, 0, 0.5);
+    font-size: 12px;
+}
+
+.feedback_btn:hover:not(:disabled) {
+    background: rgba(40, 116, 240, 0.08);
+    color: rgba(0, 0, 0, 0.8);
+}
+
+.feedback_btn.feedback_selected {
+    background: #2874f0;
+    color: white;
+    border-color: #2874f0;
+}
+
+.feedback_btn:disabled {
+    cursor: default;
+    opacity: 0.6;
+}
+
 .msg_time, .msg_time_send {
     position: absolute;
     font-size: 10px;
