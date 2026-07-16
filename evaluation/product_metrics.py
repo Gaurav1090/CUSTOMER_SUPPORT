@@ -116,13 +116,20 @@ def _extract_session_id(trace: Dict[str, Any]) -> Optional[str]:
     return (trace.get("input") or {}).get("session_id")
 
 
+def _extract_variant(trace: Dict[str, Any]) -> str:
+    """"control" for traces predating the A/B test (utils/ops.py's
+    assign_experiment_variant), not just ones explicitly assigned to it --
+    so historical data groups sensibly instead of showing up as a
+    confusing third bucket."""
+    metadata = trace.get("metadata") or {}
+    return metadata.get("experiment_variant") or "control"
+
+
 def _pct(value: Optional[float]) -> str:
     return "n/a" if value is None else f"{value * 100:.1f}%"
 
 
-def compute_product_metrics(since: datetime, until: Optional[datetime] = None) -> Dict[str, Any]:
-    traces = fetch_traces(since, until)
-
+def _aggregate(traces: List[Dict[str, Any]], feedback_scores: List[Dict[str, Any]]) -> Dict[str, Any]:
     total = len(traces)
     statuses = [_resolution_status(trace) for trace in traces]
     resolved = statuses.count("resolved")
@@ -132,13 +139,10 @@ def compute_product_metrics(since: datetime, until: Optional[datetime] = None) -
     session_ids = {_extract_session_id(trace) for trace in traces}
     session_ids.discard(None)
 
-    feedback_scores = fetch_feedback_scores(since, until)
     feedback_up = sum(1 for score in feedback_scores if score.get("value") == 1)
     feedback_down = sum(1 for score in feedback_scores if score.get("value") == 0)
 
     return {
-        "window_start": since.isoformat(),
-        "window_end": (until or datetime.now(timezone.utc)).isoformat(),
         "total_requests": total,
         "active_users": len(session_ids),
         "resolved_requests": resolved,
@@ -153,15 +157,50 @@ def compute_product_metrics(since: datetime, until: Optional[datetime] = None) -
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Compute product-tier RAG metrics from live Langfuse traffic.")
-    parser.add_argument("--hours", type=float, default=24.0, help="Look-back window in hours (default 24).")
-    args = parser.parse_args()
+def compute_product_metrics(since: datetime, until: Optional[datetime] = None) -> Dict[str, Any]:
+    traces = fetch_traces(since, until)
+    feedback_scores = fetch_feedback_scores(since, until)
+    metrics = _aggregate(traces, feedback_scores)
+    metrics["window_start"] = since.isoformat()
+    metrics["window_end"] = (until or datetime.now(timezone.utc)).isoformat()
+    return metrics
 
-    since = datetime.now(timezone.utc) - timedelta(hours=args.hours)
-    metrics = compute_product_metrics(since)
 
-    print(f"Product metrics for the last {args.hours}h ({metrics['window_start']} to {metrics['window_end']}):")
+def compute_variant_breakdown(since: datetime, until: Optional[datetime] = None) -> Dict[str, Dict[str, Any]]:
+    """Per-variant metrics for reading an A/B test's results (see
+    utils/ops.py's assign_experiment_variant) -- same underlying data as
+    compute_product_metrics, grouped by the experiment_variant tag on each
+    trace's metadata instead of rolled up across all traffic. No separate
+    experimentation platform: this is the entire "analysis" side of the
+    A/B test, reusing the same Langfuse data Tier 1/Tier 2 already
+    populate."""
+    traces = fetch_traces(since, until)
+    feedback_scores = fetch_feedback_scores(since, until)
+
+    trace_variant_by_id = {trace["id"]: _extract_variant(trace) for trace in traces if trace.get("id")}
+
+    traces_by_variant: Dict[str, List[Dict[str, Any]]] = {}
+    for trace in traces:
+        traces_by_variant.setdefault(_extract_variant(trace), []).append(trace)
+
+    scores_by_variant: Dict[str, List[Dict[str, Any]]] = {}
+    for score in feedback_scores:
+        # A feedback score for a trace outside this window's trace list
+        # (arrived after the trace's own window closed) has no known
+        # variant here -- attributed to "control" rather than dropped,
+        # same historical-data reasoning as _extract_variant.
+        variant = trace_variant_by_id.get(score.get("traceId"), "control")
+        scores_by_variant.setdefault(variant, []).append(score)
+
+    variants = set(traces_by_variant) | set(scores_by_variant)
+    return {
+        variant: _aggregate(traces_by_variant.get(variant, []), scores_by_variant.get(variant, []))
+        for variant in sorted(variants)
+    }
+
+
+def _print_metrics_block(label: str, metrics: Dict[str, Any]) -> None:
+    print(f"-- {label} --")
     print(f"  Total requests:          {metrics['total_requests']}")
     print(f"  Active users (sessions): {metrics['active_users']}")
     print(
@@ -178,6 +217,33 @@ def main() -> None:
     )
     print(f"  Feedback:                {metrics['feedback_up']} up / {metrics['feedback_down']} down")
     print(f"  CSAT proxy (thumbs-up ratio): {_pct(metrics['csat_proxy'])}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Compute product-tier RAG metrics from live Langfuse traffic.")
+    parser.add_argument("--hours", type=float, default=24.0, help="Look-back window in hours (default 24).")
+    parser.add_argument(
+        "--by-variant",
+        action="store_true",
+        help="Break metrics down by A/B test variant (utils/ops.py's assign_experiment_variant) instead of rolling up all traffic together.",
+    )
+    args = parser.parse_args()
+
+    since = datetime.now(timezone.utc) - timedelta(hours=args.hours)
+    until = datetime.now(timezone.utc)
+
+    if args.by_variant:
+        print(f"Product metrics by variant for the last {args.hours}h ({since.isoformat()} to {until.isoformat()}):")
+        breakdown = compute_variant_breakdown(since, until)
+        if not breakdown:
+            print("  No traces in this window.")
+        for variant, metrics in breakdown.items():
+            _print_metrics_block(variant, metrics)
+        return
+
+    metrics = compute_product_metrics(since, until)
+    print(f"Product metrics for the last {args.hours}h ({metrics['window_start']} to {metrics['window_end']}):")
+    _print_metrics_block("all traffic", metrics)
 
 
 if __name__ == "__main__":

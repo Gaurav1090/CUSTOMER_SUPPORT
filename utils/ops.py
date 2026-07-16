@@ -27,6 +27,25 @@ def cache_key(query: str, session_id: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def assign_experiment_variant(session_id: str, treatment_percent: int = 50) -> str:
+    """Deterministic 2-way A/B split from session_id alone -- no storage
+    needed, and the same session always lands in the same variant for its
+    whole conversation. Uses a stable hash (MD5 of the session_id string),
+    not Python's built-in hash(), which is randomized per-process via
+    PYTHONHASHSEED and would silently reassign every session on every
+    process restart/deploy.
+
+    No bespoke experimentation framework -- the assignment itself is this
+    one function; analysis reuses the Langfuse infra already wired up for
+    cost tracking (Tier 1) and the outcome signal (Tier 2), by tagging the
+    variant onto the same trace metadata those already populate. See
+    evaluation/product_metrics.py for the per-variant breakdown."""
+    if not session_id:
+        return "control"
+    bucket = int(hashlib.md5(session_id.encode("utf-8")).hexdigest(), 16) % 100
+    return "treatment" if bucket < treatment_percent else "control"
+
+
 def cosine_similarity(left: Iterable[float], right: Iterable[float]) -> float:
     left_values = list(left)
     right_values = list(right)

@@ -2,16 +2,26 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
-from evaluation.product_metrics import _resolution_status, compute_product_metrics, fetch_traces
+from evaluation.product_metrics import (
+    _resolution_status,
+    compute_product_metrics,
+    compute_variant_breakdown,
+    fetch_traces,
+)
 
 
-def _trace(session_id, citation_check=None, groundedness_verdict=None, output="an answer", **extra_metadata):
+def _trace(
+    session_id, citation_check=None, groundedness_verdict=None, output="an answer", trace_id=None, variant=None, **extra_metadata
+):
     metadata = {"session_id": session_id, **extra_metadata}
     if citation_check is not None:
         metadata["citation_check"] = citation_check
     if groundedness_verdict is not None:
         metadata["groundedness_verdict"] = groundedness_verdict
+    if variant is not None:
+        metadata["experiment_variant"] = variant
     return {
+        "id": trace_id or f"trace-{session_id}-{output}",
         "input": {"session_id": session_id},
         "output": {"answer": output} if output is not None else None,
         "metadata": metadata,
@@ -23,8 +33,8 @@ def _trace(session_id, citation_check=None, groundedness_verdict=None, output="a
     }
 
 
-def _feedback_score(value):
-    return {"name": "user_feedback", "value": value}
+def _feedback_score(value, trace_id=None):
+    return {"name": "user_feedback", "value": value, "traceId": trace_id}
 
 
 class ResolutionStatusTests(unittest.TestCase):
@@ -86,6 +96,46 @@ class ComputeProductMetricsTests(unittest.TestCase):
         self.assertIsNone(metrics["auto_resolution_rate"])
         self.assertIsNone(metrics["exclusion_rate"])
         self.assertIsNone(metrics["csat_proxy"])
+
+
+class VariantBreakdownTests(unittest.TestCase):
+    def test_splits_traces_and_feedback_by_variant(self):
+        traces = [
+            _trace("s1", trace_id="t1", variant="treatment", citation_check="passed", groundedness_verdict="passed"),
+            _trace("s2", trace_id="t2", variant="treatment", citation_check="failed"),
+            _trace("s3", trace_id="t3", variant="control", citation_check="passed", groundedness_verdict="passed"),
+        ]
+        feedback_scores = [
+            _feedback_score(1, trace_id="t1"),
+            _feedback_score(0, trace_id="t3"),
+        ]
+
+        with patch("evaluation.product_metrics.fetch_traces", return_value=traces), patch(
+            "evaluation.product_metrics.fetch_feedback_scores", return_value=feedback_scores
+        ):
+            breakdown = compute_variant_breakdown(datetime.now(timezone.utc))
+
+        self.assertEqual(set(breakdown.keys()), {"control", "treatment"})
+        self.assertEqual(breakdown["treatment"]["total_requests"], 2)
+        self.assertEqual(breakdown["treatment"]["resolved_requests"], 1)
+        self.assertEqual(breakdown["treatment"]["excluded_requests"], 1)
+        self.assertEqual(breakdown["treatment"]["feedback_up"], 1)
+        self.assertEqual(breakdown["control"]["total_requests"], 1)
+        self.assertEqual(breakdown["control"]["feedback_down"], 1)
+
+    def test_traces_without_a_variant_tag_group_as_control(self):
+        """Historical traces recorded before the A/B test existed have no
+        experiment_variant metadata at all -- they must still show up
+        somewhere sensible, not silently vanish or crash."""
+        traces = [_trace("s1", trace_id="t1", citation_check="passed", groundedness_verdict="passed")]
+
+        with patch("evaluation.product_metrics.fetch_traces", return_value=traces), patch(
+            "evaluation.product_metrics.fetch_feedback_scores", return_value=[]
+        ):
+            breakdown = compute_variant_breakdown(datetime.now(timezone.utc))
+
+        self.assertEqual(set(breakdown.keys()), {"control"})
+        self.assertEqual(breakdown["control"]["total_requests"], 1)
 
 
 class FetchTracesPaginationTests(unittest.TestCase):
