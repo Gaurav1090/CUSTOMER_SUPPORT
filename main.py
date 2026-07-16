@@ -230,9 +230,12 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         trace.add("retrieval_latency_ms", int((time.time() - retrieval_start) * 1000))
         trace.add("standalone_query", redact_pii(retriever_obj.last_standalone_query))
         trace.add("retrieved_source_ids", _source_ids(retrieved_documents))
+        is_comparison = bool(retriever_obj.last_comparison_products)
+        trace.add("comparison_products", retriever_obj.last_comparison_products)
 
         context_text = _build_context_text(retrieved_documents)
-        prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATES["product_bot"])
+        prompt_key = "product_comparison_bot" if is_comparison else "product_bot"
+        prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATES[prompt_key])
         llm = model_loader.load_llm()
         resolved_model_name = os.getenv("LLM_MODEL_NAME") or model_loader.config["llm"]["model_name"]
 

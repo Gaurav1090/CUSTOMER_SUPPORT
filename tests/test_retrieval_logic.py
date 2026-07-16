@@ -18,6 +18,7 @@ def make_retriever() -> Retriever:
     retriever._reranker = None
     retriever._rewrite_llm = None
     retriever.last_standalone_query = None
+    retriever.last_comparison_products = None
     return retriever
 
 
@@ -170,6 +171,10 @@ class HybridCallRetrieverTests(unittest.TestCase):
         )()
         self.retriever.load_retriever = lambda: fake_vector_retriever
         self.retriever.keyword_search = lambda query, top_k=5: self.sparse_docs
+        # Not a comparison-detection test -- stub it out explicitly rather
+        # than relying on the real classifier's broad except swallowing the
+        # AttributeError this bare Retriever would otherwise raise.
+        self.retriever._detect_comparison_products = lambda resolved_query, langfuse_span: None
 
     def test_hybrid_merge_returns_union_of_dense_and_sparse(self):
         results = self.retriever.call_retriever("budget earbuds")
@@ -182,6 +187,58 @@ class HybridCallRetrieverTests(unittest.TestCase):
         # d3 (rating 3.1) should be filtered out by rating>=4
         self.assertNotIn("d3", source_ids)
         self.assertIn("d1", source_ids)
+
+
+class ComparisonRoutingTests(unittest.TestCase):
+    """call_retriever's branch into per-product multi-hop retrieval when
+    comparison intent is detected -- the classifier itself is stubbed
+    (covered separately in test_query_rewriter.py), this exercises the
+    routing/merging logic around it."""
+
+    def setUp(self):
+        self.retriever = make_retriever()
+        self.retriever.config = {"retriever": {"top_k": 5}}
+
+    def test_two_products_triggers_one_hybrid_search_leg_each(self):
+        hybrid_search_calls = []
+
+        def fake_hybrid_search(rewritten_query, filters):
+            hybrid_search_calls.append((rewritten_query, filters))
+            product = filters["product_name"]["contains"]
+            return [Document(page_content=f"Product: {product}", metadata={"product_name": product})]
+
+        self.retriever._hybrid_search = fake_hybrid_search
+        self.retriever._detect_comparison_products = lambda resolved_query, langfuse_span: [
+            "Boat Rockerz 235v2",
+            "OnePlus Bullets Wireless Z",
+        ]
+
+        results = self.retriever.call_retriever("compare their battery life")
+
+        self.assertEqual(len(hybrid_search_calls), 2)
+        self.assertEqual(self.retriever.last_comparison_products, ["Boat Rockerz 235v2", "OnePlus Bullets Wireless Z"])
+        self.assertEqual(
+            {doc.metadata["product_name"] for doc in results},
+            {"boat rockerz 235v2", "oneplus bullets wireless z"},
+        )
+
+    def test_no_comparison_detected_falls_back_to_single_query_path(self):
+        self.retriever._detect_comparison_products = lambda resolved_query, langfuse_span: None
+        fake_vector_retriever = type("FakeVectorRetriever", (), {"invoke": lambda self_, query: []})()
+        self.retriever.load_retriever = lambda: fake_vector_retriever
+        self.retriever.keyword_search = lambda query, top_k=5: []
+        hybrid_search_calls = []
+        original_hybrid_search = self.retriever._hybrid_search
+        self.retriever._hybrid_search = lambda *args, **kwargs: (
+            hybrid_search_calls.append(1) or original_hybrid_search(*args, **kwargs)
+        )
+
+        self.retriever.call_retriever("how is the Boat Rockerz 235v2")
+
+        # The single-query path is still exercised (hybrid search runs
+        # exactly once) -- just not the per-product comparison branch.
+        self.assertEqual(len(hybrid_search_calls), 1)
+        self.assertIsNone(self.retriever.last_comparison_products)
 
 
 if __name__ == "__main__":

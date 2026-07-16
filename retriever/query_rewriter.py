@@ -1,4 +1,5 @@
 import logging
+from typing import List, Optional
 
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -8,6 +9,7 @@ from utils.ops import finish_llm_generation, start_llm_generation
 logger = logging.getLogger(__name__)
 
 NO_HISTORY_SENTINEL = "No prior conversation."
+_PRODUCT_LINE_PREFIX = "PRODUCT:"
 
 
 def contextualize_query(question: str, chat_history: str, load_llm, langfuse_span=None, model_name=None) -> str:
@@ -48,3 +50,44 @@ def contextualize_query(question: str, chat_history: str, load_llm, langfuse_spa
         logger.exception("Query contextualization failed; falling back to raw question.")
         finish_llm_generation(generation, None, None)
         return question
+
+
+def classify_comparison_products(question: str, load_llm, langfuse_span=None, model_name=None) -> Optional[List[str]]:
+    """Detect whether `question` is asking to compare 2+ specific named
+    products, via a small/fast LLM (same rewrite model as
+    contextualize_query, not a separate provider call). Returns the
+    extracted product names when it's a genuine multi-product comparison
+    (2 or more), None otherwise -- including on any failure, since
+    retrieval must never hard-fail because classification failed; a
+    missed comparison just falls back to normal single-query retrieval,
+    which is the existing, already-working behavior.
+
+    A structured "PRODUCT: <name>" line-per-product format is used instead
+    of asking for JSON -- far more reliable to parse out of a small model's
+    output than balanced JSON syntax, and trivial to validate (a response
+    with fewer than 2 PRODUCT: lines is treated as "not a comparison")."""
+    if not question or not question.strip():
+        return None
+
+    generation = None
+    try:
+        llm = load_llm()
+        prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATES["comparison_classifier"])
+        chain = prompt | llm
+        inputs = {"question": question}
+        generation = start_llm_generation(langfuse_span, "comparison_classification", model_name, input_data=inputs)
+        ai_message = chain.invoke(inputs)
+        raw = (ai_message.content or "").strip()
+        finish_llm_generation(generation, raw, getattr(ai_message, "usage_metadata", None))
+
+        products = [
+            line.strip()[len(_PRODUCT_LINE_PREFIX):].strip()
+            for line in raw.splitlines()
+            if line.strip().upper().startswith(_PRODUCT_LINE_PREFIX)
+        ]
+        products = [product for product in products if product]
+        return products if len(products) >= 2 else None
+    except Exception:
+        logger.exception("Comparison classification failed; treating as a normal (non-comparison) query.")
+        finish_llm_generation(generation, None, None)
+        return None

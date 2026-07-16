@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Tuple
 from dotenv import load_dotenv
 from langchain_core.documents import Document
 
-from retriever.query_rewriter import contextualize_query
+from retriever.query_rewriter import classify_comparison_products, contextualize_query
 from utils.bm25_index import load_index
 from utils.chroma_utils import create_chroma_store
 from utils.config_loader import load_config
@@ -39,6 +39,10 @@ class Retriever:
         self._reranker = None
         self._rewrite_llm = None
         self.last_standalone_query = None
+        # Set by call_retriever when the query is detected as a multi-product
+        # comparison -- main.py reads this to pick the comparison prompt
+        # template and know the retrieved documents are grouped by product.
+        self.last_comparison_products = None
 
     def _load_env_variables(self):
         load_dotenv()
@@ -278,6 +282,54 @@ class Retriever:
         fallback_top_k = self.dynamic_top_k(reranked_documents)
         return reranked_documents[:fallback_top_k]
 
+    def _hybrid_search(self, rewritten_query: str, filters: Dict[str, Dict[str, Any]]) -> List[Document]:
+        """Dense (Chroma) + sparse (BM25) retrieval, RRF-merged and
+        reranked -- the single-query search leg shared by both a normal
+        call_retriever pass and each per-product leg of a multi-hop
+        comparison query."""
+        retriever = self.load_retriever()
+        keyword_top_k = max(6, self._candidate_pool_top_k() * 2)
+
+        # Dense and sparse lookups are independent I/O calls -- run them
+        # concurrently instead of sequentially to offset the added
+        # latency from query contextualization and semantic reranking.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            vector_future = executor.submit(retriever.invoke, rewritten_query)
+            keyword_future = executor.submit(self.keyword_search, rewritten_query, keyword_top_k)
+            vector_output = self.apply_metadata_filters(vector_future.result(), filters)
+            keyword_output = self.apply_metadata_filters(keyword_future.result(), filters)
+
+        merged_output = self.rrf_merge(vector_output, keyword_output)
+        return self._rerank(merged_output, rewritten_query, filters)
+
+    def _detect_comparison_products(self, resolved_query: str, langfuse_span) -> "list[str] | None":
+        return classify_comparison_products(
+            resolved_query,
+            self._load_rewrite_llm,
+            langfuse_span=langfuse_span,
+            model_name=self._resolved_rewrite_model_name(),
+        )
+
+    def _retrieve_comparison(self, resolved_query: str, products: List[str]) -> List[Document]:
+        """One hybrid-search leg per product instead of one shared query --
+        a single query embedding for "compare A's battery life to B's"
+        semantically favors whichever product's phrasing is closer, which
+        silently drops the other product's context. Each leg is filtered
+        to its own product (product_name metadata, populated at ingestion)
+        so one product's stronger matches can't crowd out the other's, and
+        results stay grouped by product in the returned list -- main.py's
+        _build_context_text renders them in that order, and each chunk's
+        page_content already starts with "Product: <name>" (the Tier 1 CSV
+        embedding fix), so the LLM sees clearly which product each block
+        of evidence is about."""
+        all_documents: List[Document] = []
+        for product in products:
+            sub_query = f"{product}: {resolved_query}"
+            rewritten_query = self.rewrite_query(sub_query)
+            filters = {"product_name": {"contains": product.lower()}}
+            all_documents.extend(self._hybrid_search(rewritten_query, filters))
+        return all_documents
+
     def call_retriever(self, query: str, chat_history: str = None, langfuse_span=None) -> List[Document]:
         try:
             resolved_query = query
@@ -291,23 +343,14 @@ class Retriever:
                 )
             self.last_standalone_query = resolved_query
 
+            products = self._detect_comparison_products(resolved_query, langfuse_span)
+            self.last_comparison_products = products
+            if products:
+                return self._retrieve_comparison(resolved_query, products)
+
             rewritten_query = self.rewrite_query(resolved_query)
             filters = self.parse_metadata_filters(query)
-            retriever = self.load_retriever()
-
-            keyword_top_k = max(6, self._candidate_pool_top_k() * 2)
-
-            # Dense and sparse lookups are independent I/O calls -- run them
-            # concurrently instead of sequentially to offset the added
-            # latency from query contextualization and semantic reranking.
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                vector_future = executor.submit(retriever.invoke, rewritten_query)
-                keyword_future = executor.submit(self.keyword_search, rewritten_query, keyword_top_k)
-                vector_output = self.apply_metadata_filters(vector_future.result(), filters)
-                keyword_output = self.apply_metadata_filters(keyword_future.result(), filters)
-
-            merged_output = self.rrf_merge(vector_output, keyword_output)
-            return self._rerank(merged_output, rewritten_query, filters)
+            return self._hybrid_search(rewritten_query, filters)
         except Exception as exc:
             raise RuntimeError("Failed to retrieve relevant documents.") from exc
 
