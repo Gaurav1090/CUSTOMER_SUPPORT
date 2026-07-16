@@ -16,6 +16,7 @@ from utils.chroma_utils import create_chroma_store
 from utils.config_loader import load_config
 from utils.model_loader import ModelLoader
 from utils.object_store import ensure_dir, file_fingerprint, list_files, move_file, read_bytes, read_json, write_json
+from utils.pii import redact_pii
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +139,7 @@ class DataIngestion:
         for page_number, page in enumerate(reader.pages, start=1):
             try:
                 text = clean_text(page.extract_text() or "")
+                text = redact_pii(text)
             except Exception:
                 logger.exception("Failed to extract text from %s page %d; skipping page.", uri, page_number)
                 continue
@@ -213,6 +215,7 @@ class DataIngestion:
                 }
                 page_content = clean_text(", ".join(f"{col}: {row[col]}" for col in df.columns))
 
+            page_content = redact_pii(page_content)
             if page_content:
                 documents.append(Document(page_content=page_content, metadata=metadata))
         return documents

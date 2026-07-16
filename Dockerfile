@@ -43,6 +43,11 @@ RUN pip install --no-cache-dir --prefer-binary --no-compile -r requirements.txt 
     # working in this image yet).
     pip install --no-cache-dir --prefer-binary --no-compile gcsfs redis
 
+# utils/pii.py's NER redaction needs this model; presidio-analyzer/spacy
+# are in requirements.txt but the model itself is a separate download, not
+# a pip dependency of either package.
+RUN python -m spacy download en_core_web_sm
+
 RUN mkdir -p /app/chroma_db /app/data && \
     adduser --disabled-password --gecos "" appuser && \
     chown -R appuser:appuser /app

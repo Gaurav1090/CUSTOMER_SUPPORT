@@ -24,5 +24,13 @@ torch==2.13.0
 pypdf==6.4.0
 rank-bm25==0.2.2
 fsspec==2026.6.0
+# PII redaction (utils/pii.py) -- deliberately a hard requirement, not in
+# requirements-optional.txt. A silently-skipped security control is worse
+# than a missing feature (see the redis/langfuse lesson from
+# requirements-optional.txt never being installed in the Docker image).
+presidio-analyzer==2.2.363
+# spacy 3.7.0 and 3.8.14 are explicitly excluded by presidio-analyzer's
+# dependency range.
+spacy==3.8.13
 
 -e .
