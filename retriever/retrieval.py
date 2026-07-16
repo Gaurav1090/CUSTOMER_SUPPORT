@@ -221,12 +221,12 @@ class Retriever:
         bm25_index = self._load_bm25_index()
         return bm25_index.search(query, top_k=top_k)
 
+    def _resolved_rewrite_model_name(self) -> str:
+        return os.getenv("LLM_REWRITE_MODEL_NAME", self.config.get("llm", {}).get("rewrite_model_name"))
+
     def _load_rewrite_llm(self):
         if self._rewrite_llm is None:
-            rewrite_model_name = os.getenv(
-                "LLM_REWRITE_MODEL_NAME", self.config.get("llm", {}).get("rewrite_model_name")
-            )
-            self._rewrite_llm = self.model_loader.load_llm(model_name=rewrite_model_name)
+            self._rewrite_llm = self.model_loader.load_llm(model_name=self._resolved_rewrite_model_name())
         return self._rewrite_llm
 
     def _candidate_pool_top_k(self) -> int:
@@ -278,11 +278,17 @@ class Retriever:
         fallback_top_k = self.dynamic_top_k(reranked_documents)
         return reranked_documents[:fallback_top_k]
 
-    def call_retriever(self, query: str, chat_history: str = None) -> List[Document]:
+    def call_retriever(self, query: str, chat_history: str = None, langfuse_span=None) -> List[Document]:
         try:
             resolved_query = query
             if chat_history:
-                resolved_query = contextualize_query(query, chat_history, self._load_rewrite_llm)
+                resolved_query = contextualize_query(
+                    query,
+                    chat_history,
+                    self._load_rewrite_llm,
+                    langfuse_span=langfuse_span,
+                    model_name=self._resolved_rewrite_model_name(),
+                )
             self.last_standalone_query = resolved_query
 
             rewritten_query = self.rewrite_query(resolved_query)

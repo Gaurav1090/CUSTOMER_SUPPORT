@@ -13,8 +13,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 
-from langchain_core.output_parsers import StrOutputParser
-
 from langchain_core.prompts import ChatPromptTemplate
 
 from retriever.retrieval import Retriever
@@ -27,7 +25,9 @@ from utils.ops import (
     SessionStore,
     build_langfuse_trace,
     finish_langfuse_trace,
+    finish_llm_generation,
     new_request_id,
+    start_llm_generation,
 )
 
 from prompt_library.prompt import PROMPT_TEMPLATES
@@ -140,11 +140,16 @@ def _build_chat_history(session_id: str) -> str:
     )
 
 
-def _judge_groundedness(context: str, answer: str) -> bool:
+def _judge_groundedness(context: str, answer: str, langfuse_span=None) -> bool:
     judge_prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATES["grounding_judge"])
     llm = model_loader.load_llm()
-    chain = judge_prompt | llm | StrOutputParser()
-    verdict = chain.invoke({"context": context, "answer": answer}).strip().upper()
+    chain = judge_prompt | llm
+    inputs = {"context": context, "answer": answer}
+    model_name = os.getenv("LLM_MODEL_NAME") or model_loader.config["llm"]["model_name"]
+    generation = start_llm_generation(langfuse_span, "groundedness_judge", model_name, input_data={"answer": answer})
+    ai_message = chain.invoke(inputs)
+    verdict = (ai_message.content or "").strip().upper()
+    finish_llm_generation(generation, verdict, getattr(ai_message, "usage_metadata", None))
     return verdict == "YES"
 
 
@@ -217,7 +222,7 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         chat_history = _build_chat_history(session_id)
 
         retrieval_start = time.time()
-        retrieved_documents = retriever_obj.call_retriever(query, chat_history=chat_history)
+        retrieved_documents = retriever_obj.call_retriever(query, chat_history=chat_history, langfuse_span=langfuse_trace)
         trace.add("retrieval_latency_ms", int((time.time() - retrieval_start) * 1000))
         trace.add("standalone_query", retriever_obj.last_standalone_query)
         trace.add("retrieved_source_ids", _source_ids(retrieved_documents))
@@ -225,11 +230,17 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
         context_text = _build_context_text(retrieved_documents)
         prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATES["product_bot"])
         llm = model_loader.load_llm()
+        resolved_model_name = os.getenv("LLM_MODEL_NAME") or model_loader.config["llm"]["model_name"]
 
-        chain = prompt | llm | StrOutputParser()
+        chain = prompt | llm
+        generation = start_llm_generation(
+            langfuse_trace, "answer_generation", resolved_model_name, input_data={"question": query}
+        )
         generation_start = time.time()
-        output = chain.invoke({"context": context_text, "question": query, "chat_history": chat_history})
+        ai_message = chain.invoke({"context": context_text, "question": query, "chat_history": chat_history})
         trace.add("generation_latency_ms", int((time.time() - generation_start) * 1000))
+        output = ai_message.content if isinstance(ai_message.content, str) else str(ai_message.content)
+        finish_llm_generation(generation, output, getattr(ai_message, "usage_metadata", None))
         output = strip_reasoning_tokens(output)
 
         citation_check = "skipped_no_context"
@@ -242,7 +253,9 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
                 output = INSUFFICIENT_CONTEXT_UNGROUNDED
                 groundedness_verdict = "skipped_citation_failed"
             else:
-                groundedness_verdict = "passed" if _judge_groundedness(context_text, output) else "failed"
+                groundedness_verdict = (
+                    "passed" if _judge_groundedness(context_text, output, langfuse_span=langfuse_trace) else "failed"
+                )
                 if groundedness_verdict == "failed":
                     output = INSUFFICIENT_CONTEXT_UNGROUNDED
         trace.add("citation_check", citation_check)

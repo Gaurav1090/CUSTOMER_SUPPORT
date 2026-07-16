@@ -402,3 +402,43 @@ def finish_langfuse_trace(
         span.end()
     except Exception:
         logger.exception("Failed to finalize Langfuse trace.")
+
+
+def start_llm_generation(parent_span, name: str, model: Optional[str], input_data: Optional[Any] = None):
+    """Start a nested Langfuse *generation* observation under parent_span
+    for a single LLM call. Distinct from the plain "span" build_langfuse_trace
+    creates -- only an as_type="generation" observation with a model name
+    carries usage_details, which is what makes Langfuse's own cost
+    dashboard compute per-model/per-step token cost automatically. Returns
+    None (and the caller skips finish_llm_generation too) when Langfuse is
+    disabled/unavailable, same no-op-on-failure pattern as
+    build_langfuse_trace -- an observability hiccup must never break the
+    actual LLM call it's wrapping."""
+    if parent_span is None:
+        return None
+    try:
+        return parent_span.start_observation(name=name, as_type="generation", model=model, input=input_data)
+    except Exception:
+        logger.exception("Failed to start Langfuse generation observation: %s", name)
+        return None
+
+
+def finish_llm_generation(generation, output: Optional[str], usage_metadata: Optional[Dict[str, Any]]) -> None:
+    """End a generation observation started by start_llm_generation,
+    translating LangChain's usage_metadata keys (input_tokens/output_tokens/
+    total_tokens -- present on AIMessage when the provider reports usage,
+    None otherwise) into Langfuse's usage_details schema (input/output/total)."""
+    if generation is None:
+        return
+    try:
+        usage_details = None
+        if usage_metadata:
+            usage_details = {
+                "input": usage_metadata.get("input_tokens"),
+                "output": usage_metadata.get("output_tokens"),
+                "total": usage_metadata.get("total_tokens"),
+            }
+        generation.update(output=output, usage_details=usage_details)
+        generation.end()
+    except Exception:
+        logger.exception("Failed to finalize Langfuse generation observation.")
