@@ -196,11 +196,20 @@ class DataIngestion:
                 # review happened to repeat those words. product_title/
                 # rating/summary were metadata-only, invisible to both dense
                 # and BM25 search (which both index off page_content).
+                #
+                # Only the Review field is redacted below (not Product/
+                # Rating/Summary): those three are structured catalog data
+                # that can't contain a customer's PII, and running the
+                # NER pass over them risks false positives on brand/product
+                # names (e.g. "BoAt" misread as a LOCATION entity) that
+                # would permanently corrupt the product identity in the
+                # vector store. Review is freeform customer text, the only
+                # field where real PII could actually show up.
                 labeled_fields = (
                     ("Product", _clean_field(row.get("product_title"))),
                     ("Rating", _clean_field(row.get("rating"))),
                     ("Summary", _clean_field(row.get("summary"))),
-                    ("Review", _clean_field(row.get("review"))),
+                    ("Review", redact_pii(_clean_field(row.get("review")))),
                 )
                 page_content = clean_text(
                     "\n".join(f"{label}: {value}" for label, value in labeled_fields if value)
@@ -214,8 +223,12 @@ class DataIngestion:
                     "modality": "text",
                 }
                 page_content = clean_text(", ".join(f"{col}: {row[col]}" for col in df.columns))
+                # Unknown schema -- can't tell which columns are freeform
+                # customer text vs. structured data, so redact the whole
+                # row as the safer default (unlike the review-style branch
+                # above, which redacts only the known-freeform Review field).
+                page_content = redact_pii(page_content)
 
-            page_content = redact_pii(page_content)
             if page_content:
                 documents.append(Document(page_content=page_content, metadata=metadata))
         return documents

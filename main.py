@@ -297,8 +297,15 @@ def invoke_chain_details(query: str, session_id: str = "default", request_id: st
                 output = INSUFFICIENT_CONTEXT_UNGROUNDED
                 groundedness_verdict = "skipped_citation_failed"
             else:
+                # redact_pii() runs a Presidio/spaCy NER pass, which has known
+                # false positives on brand/product names (see utils/pii.py) --
+                # too risky to apply to `output` itself, since that would
+                # corrupt the answer actually shown to the user. Redact a
+                # throwaway copy instead, just for this external judge call.
                 groundedness_verdict = (
-                    "passed" if _judge_groundedness(context_text, output, langfuse_span=langfuse_trace) else "failed"
+                    "passed"
+                    if _judge_groundedness(context_text, redact_pii(output), langfuse_span=langfuse_trace)
+                    else "failed"
                 )
                 if groundedness_verdict == "failed":
                     output = INSUFFICIENT_CONTEXT_UNGROUNDED
