@@ -60,7 +60,8 @@ Generation (prompt_library/prompt.py + utils/model_loader.py)
         v
 Guardrails
   - citation check: flags answers citing a source that wasn't retrieved
-  - LLM-as-judge groundedness check
+  - LLM-as-judge groundedness check (fed a PII-redacted copy of the answer,
+    since it's an external call to the LLM provider like any other)
   - either failing -> safe "Insufficient context" fallback, not a guess
         |
         v
@@ -159,10 +160,12 @@ points at, using whatever `embedding_model` is configured. **If you change
 the embedding provider/model later, you must re-ingest into a new collection
 name** -- different embedding models produce different vector spaces and
 can't share a collection. Each chunk's embedded text includes labeled
-`Product`/`Rating`/`Summary`/`Review` fields (not review text alone), and
-source text is PII-redacted before embedding. Successfully processed files
-are moved to `ARCHIVE_PATH` afterward, so re-running only ever picks up
-genuinely new files.
+`Product`/`Rating`/`Summary`/`Review` fields (not review text alone); only
+the freeform `Review` field is PII-redacted before embedding (`Product`/
+`Rating`/`Summary` are structured catalog data, and redacting them risked
+NER false positives on brand names -- see PII redaction below). Successfully
+processed files are moved to `ARCHIVE_PATH` afterward, so re-running only
+ever picks up genuinely new files.
 
 ## Running it yourself
 
@@ -402,14 +405,34 @@ level: unset the two keys and every call becomes a no-op.
 ### PII redaction
 
 `utils/pii.py`'s `redact_pii()` runs regex-based redaction (email/phone/card)
-plus NER (Presidio + spaCy's `en_core_web_sm`, for names/locations) at two
-points: on source documents during ingestion (§ above), and on every
-trace/generation's input-output text right before it's sent to Langfuse. The
-LLM itself still sees real, unredacted text -- redaction targets the specific
-point data would otherwise leave the process to a third-party tool. This is
-a hard dependency (not optional-install) on purpose: a security control that
-can silently disappear because of a missing pip install is worse than not
-having the feature at all.
+plus NER (Presidio + spaCy's `en_core_web_sm`, for names/locations) at three
+points: on source documents during ingestion (§ above), on every
+trace/generation's input-output text right before it's sent to Langfuse, and
+(as of 2026-07-17) on the answer passed to the LLM-as-judge groundedness
+check before that external call, since it's a call to the LLM provider like
+any other -- the answer actually returned to the user stays untouched. The
+main generation LLM call itself still sees real, unredacted retrieved
+context -- redaction targets the specific points data would otherwise leave
+the process, either to a third-party tool or to a provider call whose input
+isn't the user's own conversation.
+
+Ingestion-time redaction is scoped to the freeform `Review` field only for
+review-style CSV rows (whole-text for PDFs and any other CSV shape, where
+there's no reliable structured/freeform split to exploit). This was fixed
+2026-07-17 after the unscoped version produced a real false positive:
+`en_core_web_sm` misread the brand name "BoAt" as a `LOCATION` entity,
+permanently corrupting `Product: BoAt BassHeads 100 Wired Headset` into
+`Product: [REDACTED_LOCATION] BassHeads 100 Wired Headset` in the vector
+store. `Product`/`Rating`/`Summary` are structured catalog data that can't
+contain a customer's PII in the first place, so only `Review` -- the one
+field where real PII could actually appear -- is redacted now. Fixing this
+required a full Chroma collection rebuild (content-hash-based chunk IDs mean
+a plain re-ingest would have added corrected duplicates alongside the
+corrupted originals, not replaced them).
+
+This is a hard dependency (not optional-install) on purpose: a security
+control that can silently disappear because of a missing pip install is
+worse than not having the feature at all.
 
 ### Prompt-injection defense
 
