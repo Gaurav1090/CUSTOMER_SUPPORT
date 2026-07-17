@@ -1,7 +1,8 @@
 chroma:
   # Back to the original collection -- matches the local HuggingFace
-  # embedding space below, and it's already fully populated (450 rows /
-  # 542 chunks) from before the Google detour, so no re-ingestion needed.
+  # embedding space below. Rebuilt 2026-07-17 (450 rows / 673 chunks)
+  # after scoping ingestion-time PII redaction to the Review field only
+  # -- re-ingest if you change what gets embedded into page_content.
   collection_name: "ecommercedata"
 
 embedding_model:

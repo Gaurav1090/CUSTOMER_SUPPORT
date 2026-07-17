@@ -2,13 +2,13 @@
 
 Single source of truth for this codebase: what it is, how a request flows through it end to end, every API surface, every config knob, and the reasoning behind the non-obvious decisions. Written to let someone with zero prior context become productive without re-deriving anything from the source.
 
-Last updated: 2026-07-16, after a full architecture-critique-driven hardening pass covering Redis/ingestion infra, retrieval quality, security/compliance, observability/cost, and product-outcome measurement — see [§20 Recent hardening](#20-recent-hardening-2026-07-16) for the complete list of what changed and why, and [§21 Known limitations / not accomplished](#21-known-limitations--not-accomplished) for what was deliberately left undone.
+Last updated: 2026-07-17, after fixing two PII-redaction correctness bugs (an unredacted external LLM-as-judge call, and false-positive brand-name redaction at ingestion) on top of 2026-07-16's full architecture-critique-driven hardening pass covering Redis/ingestion infra, retrieval quality, security/compliance, observability/cost, and product-outcome measurement — see [§20 Recent hardening](#20-recent-hardening-2026-07-16-to-2026-07-17) for the complete list of what changed and why, and [§21 Known limitations / not accomplished](#21-known-limitations--not-accomplished) for what was deliberately left undone.
 
 ---
 
 ## 1. What this is
 
-A FastAPI-based e-commerce product-support chatbot. It answers questions about products using **retrieval-augmented generation (RAG)** over a corpus of product reviews (currently: the bundled Flipkart review dataset, ~576 chunks after the product-context embedding fix in §20). It is not a general chatbot — it refuses to answer anything it cannot ground in retrieved evidence, on purpose.
+A FastAPI-based e-commerce product-support chatbot. It answers questions about products using **retrieval-augmented generation (RAG)** over a corpus of product reviews (currently: the bundled Flipkart review dataset, ~673 chunks after the product-context embedding fix and the PII-redaction-scoping rebuild, both in §20). It is not a general chatbot — it refuses to answer anything it cannot ground in retrieved evidence, on purpose.
 
 Core design commitments, all visible directly in the code:
 
@@ -17,7 +17,7 @@ Core design commitments, all visible directly in the code:
 - **Multi-product aware.** A comparison question ("compare A's battery life to B's") is detected and retrieves each named product separately, instead of one query embedding that only ever favors whichever product's phrasing is closer.
 - **Provider-agnostic.** LLM provider (Groq / Google Gemini / HuggingFace) and embedding provider are both swappable via config, with env-var overrides for the LLM side so you can hop providers mid-incident without a redeploy.
 - **Defended on both prompt-injection channels.** Retrieved review content is delimited and labeled untrusted data, never instructions (defends the *ingestion* channel). The user's own chat message is pattern-checked for jailbreak/override attempts before it ever reaches retrieval (defends the *input* channel, added §20).
-- **PII-aware.** Source documents and live chat text are redacted (regex + NER) before embedding or before being sent to third-party observability tooling.
+- **PII-aware.** Source documents (freeform review text specifically) and live chat text are redacted (regex + NER) before embedding, before being sent to third-party observability tooling, and before the answer is sent to the external LLM-as-judge groundedness check.
 - **Measured, not just monitored.** Every request is traced (Langfuse), every LLM call's cost is tracked individually, and a live-traffic product-metrics script computes auto-resolution rate, exclusion rate, and a CSAT proxy from real usage — not just an offline golden-set score.
 - **Degrades loudly, never silently.** Redis unavailable → in-memory fallback, logged. Cohere unavailable → lexical reranking, logged as a warning on every query. Langfuse unset → tracing becomes a no-op. Nothing silently produces degraded behavior without saying so in the logs.
 
@@ -33,8 +33,8 @@ Core design commitments, all visible directly in the code:
 | Vector store | Chroma Cloud | No local fallback once cloud creds are set — see [§9](#9-generation) |
 | Keyword search | BM25 (`rank_bm25`), JSON index in object storage | Runs alongside dense search, merged via RRF |
 | Reranking | Cohere Rerank (`rerank-english-v3.0`), optional | Falls back to lexical term-overlap reranking if unset |
-| Cache / sessions / rate limiting | Redis (Memorystore in dev), in-memory fallback | `fakeredis` for tests; **actually wired and live-verified in `dev`** as of this session (was designed but never deployed before — see [§20](#20-recent-hardening-2026-07-16)) |
-| PII redaction | Regex (email/phone/card) + Presidio/spaCy NER (names/locations) | `utils/pii.py`, hard dependency (not optional-install), applied at ingestion and at the Langfuse boundary |
+| Cache / sessions / rate limiting | Redis (Memorystore in dev), in-memory fallback | `fakeredis` for tests; **actually wired and live-verified in `dev`** as of the 2026-07-16 session (was designed but never deployed before — see [§20](#20-recent-hardening-2026-07-16-to-2026-07-17)) |
+| PII redaction | Regex (email/phone/card) + Presidio/spaCy NER (names/locations) | `utils/pii.py`, hard dependency (not optional-install), applied to the freeform `Review` field at ingestion, at the Langfuse boundary, and (as of 2026-07-17) to the answer passed to the LLM-as-judge groundedness call |
 | Prompt-injection defense | `<doc>` delimiters (retrieval-content channel) + pattern-based input guard (`utils/prompt_guard.py`, user-message channel) | Two independent channels, added in different sessions |
 | Observability | Langfuse (v4, OTel-based) + structured JSON request logs | Per-request trace, per-LLM-call generation observation (model + token usage), citation/groundedness/user-feedback all as first-class Langfuse **scores** |
 | Cost tracking | Langfuse `generation` observations per LLM call | Query rewrite, comparison classification, answer generation, and the groundedness judge are each tracked separately — see [§14](#14-cost-tracking) |
@@ -325,7 +325,7 @@ This is `main.py`'s `invoke_chain_details()` — the one function every chat req
 12. **Guardrails, in order:**
     - If retrieval returned nothing → immediate refusal, no LLM guardrail calls needed.
     - **Citation check** (`_verify_citations`) — regex-extracts every `source:ID` token from the answer and checks each against the set of actually-retrieved source IDs. Any mismatch → refusal.
-    - **Groundedness judge** (`_judge_groundedness`) — a separate LLM call (also tracked as its own Langfuse generation), strict YES/NO, asks "is this answer actually supported by this context?"
+    - **Groundedness judge** (`_judge_groundedness`) — a separate LLM call (also tracked as its own Langfuse generation), strict YES/NO, asks "is this answer actually supported by this context?" Fed a `redact_pii()`-redacted copy of the answer (as of 2026-07-17, §13) — the judge is itself an external call to the LLM provider, so it gets the same PII treatment as the Langfuse boundary. The redacted copy is only used for this call; the actual answer returned to the user is untouched.
     - Either check failing → the answer is replaced with a fixed refusal string, never the model's actual (possibly ungrounded) text.
 
 13. **Cache write** — only if the output is not a refusal (a citation/groundedness failure is often transient sampling variance; caching it would make the refusal sticky for the whole TTL).
@@ -452,6 +452,10 @@ After a successful run, `_archive_files` moves each processed file from the land
 
 Both the CSV and PDF loaders run `redact_pii()` (§13) on extracted text before it's chunked — source documents are exactly as untrusted as live chat input from a PII standpoint.
 
+**Scoped to the freeform field only, as of 2026-07-17.** For review-style CSV rows, `redact_pii()` now runs only on the `Review` value, not on the assembled `Product`/`Rating`/`Summary`/`Review` block as a whole. Running the Presidio/spaCy NER pass over `Product`/`Rating`/`Summary` — structured catalog data that can't contain a customer's PII in the first place — produced real false positives: `en_core_web_sm` misread the brand name "BoAt" as a `LOCATION` entity, permanently rewriting `Product: BoAt BassHeads 100 Wired Headset` to `Product: [REDACTED_LOCATION] BassHeads 100 Wired Headset` in the vector store, corrupting product identity for retrieval, citations, and the answer shown to the user. `Review` is the only field where genuine customer PII could actually appear, so it's the only one redacted now. PDF text and the generic (non-review-schema) CSV fallback branch still redact the whole extracted text — for those, there's no structured/freeform split to exploit, so whole-text redaction remains the safer default.
+
+Because this changes what gets embedded (and therefore what hashes into each chunk's content-based ID), the Chroma collection was wiped and cleanly re-ingested — same reasoning as §12.2's rebuild. Collection went from 576 chunks to 673 (chunk boundaries shift when the embedded text's length changes).
+
 ### 12.4 Scale
 
 Current implementation uses `pandas.read_csv` + `df.iterrows()` (a Python row loop) and sequential Chroma upserts (batched at 250 records, Chroma Cloud's write cap). This is adequate for the current dataset size; **deliberately not optimized further** without a real volume number demanding it — see [§21](#21-known-limitations--not-accomplished).
@@ -465,9 +469,10 @@ Current implementation uses `pandas.read_csv` + `df.iterrows()` (a Python row lo
 - **Regex**, for structured PII: emails, phone numbers, card-like numbers. Patterns are deliberately narrow enough to not false-positive on this app's own data shape (ratings like `4.5`, model numbers like `235v2`).
 - **NER via Presidio** (spaCy `en_core_web_sm` under the hood, explicitly configured — Presidio's default expects the much larger `en_core_web_lg`), for names and locations regex can't catch.
 
-Applied at two exposure surfaces:
-- **Ingestion** (§12.3) — source documents before embedding.
-- **The Langfuse boundary** (`utils/ops.py`) — trace input/output and every nested generation observation's input/output, before any of it leaves the process. The LLM itself still sees the real, unredacted text (it needs the real data to answer correctly) — redaction happens specifically at the point data would otherwise persist to a third-party observability tool with no retention policy of its own.
+Applied at three exposure surfaces:
+- **Ingestion** (§12.3) — source documents before embedding. Scoped to the freeform `Review` field for review-style CSV rows (as of 2026-07-17); whole-text for PDFs and the generic CSV fallback, where there's no reliable way to tell structured fields from freeform ones.
+- **The Langfuse boundary** (`utils/ops.py`) — trace input/output and every nested generation observation's input/output, before any of it leaves the process. The main generation LLM call itself still sees the real, unredacted retrieved context (it needs the real data to answer correctly) — redaction happens specifically at the point data would otherwise persist to a third-party observability tool with no retention policy of its own.
+- **The groundedness-judge call** (`main.py`, as of 2026-07-17) — `_judge_groundedness` previously received the freshly generated answer unredacted, an external call to the LLM provider like any other. It now receives `redact_pii(output)`; the answer actually returned to the user is a separate, untouched variable, so the judge's redaction never corrupts what the user sees (redacting the live answer itself would risk the same brand-name false positives described in §12.3).
 
 Deliberately a **hard dependency** in `requirements.txt`, not `requirements-optional.txt` — a silently-skipped security control is worse than a missing feature (see §20's Langfuse-never-installed bug, the exact failure mode this decision avoids repeating).
 
@@ -562,7 +567,8 @@ Every feature described in this document has been live-verified against this dep
 - ✅ Multi-hop retrieval for comparison questions instead of one query that silently favors one product.
 
 **Privacy / compliance**
-- ✅ PII redaction (regex + NER) at ingestion and at the observability boundary — a hard dependency, not an optional install that can silently go missing.
+- ✅ PII redaction (regex + NER) at ingestion, at the observability boundary, and at the LLM-as-judge call — a hard dependency, not an optional install that can silently go missing.
+- ✅ Ingestion-time redaction scoped to freeform text only (not structured catalog fields), avoiding NER false positives that would otherwise corrupt product names.
 - ✅ LLM-generated content sanitized (DOMPurify) before DOM injection in the web UI.
 - ⚠️ No retention/TTL policy on Langfuse trace data itself (a Langfuse Cloud dashboard/plan setting, not something this repo controls) — see §21.
 
@@ -591,9 +597,9 @@ Every feature described in this document has been live-verified against this dep
 
 ---
 
-## 20. Recent hardening (2026-07-16)
+## 20. Recent hardening (2026-07-16 to 2026-07-17)
 
-A single extended session working through a self-authored architecture critique, tier by tier, each item implemented, tested, deployed, and live-verified against the real service before moving to the next:
+A single extended session (2026-07-16) working through a self-authored architecture critique, tier by tier, each item implemented, tested, deployed, and live-verified against the real service before moving to the next, followed by a short 2026-07-17 session fixing two PII-redaction correctness bugs found during a follow-up review:
 
 1. **Redis wiring** — designed since an earlier session but never actually deployed; now live in `dev` (§18.1).
 2. **Ingestion archive step** — landing → processed → archive pattern, replacing the demo CSV baked into the Docker image.
@@ -607,8 +613,10 @@ A single extended session working through a self-authored architecture critique,
 10. **Product/business metrics** — `evaluation/product_metrics.py`, live-traffic auto-resolution/exclusion/CSAT (§16). Caught a real API-shape bug doing so (the traces list endpoint returns score IDs, not full score objects, unlike the trace detail endpoint).
 11. **A/B testing** — variant-tagged Langfuse traces, no bespoke framework (§17).
 12. **Input-side prompt-injection guard** — pattern-based, blocks before retrieval (§15).
+13. **Groundedness-judge PII redaction (2026-07-17)** — `_judge_groundedness` was sending the freshly generated answer to the external LLM provider unredacted; it now gets a redacted copy, and only for that call (§13).
+14. **Ingestion-time redaction scoping fix (2026-07-17)** — PII redaction on review-style CSV rows was running over the whole assembled row instead of just the freeform `Review` field, causing NER false positives on brand names (e.g. "BoAt" misread as a `LOCATION` entity) that permanently corrupted product names in the vector store. Fixed and the Chroma collection rebuilt from source (§12.3).
 
-Every item above was live-verified against the actual deployed `dev` service (not just local/mocked), which is what caught items 6, 7's SSE bug, and 10's API-shape bug — none of which the existing unit test suite alone would have surfaced.
+Every item above was live-verified — items 1-12 against the actual deployed `dev` service (not just local/mocked), which is what caught items 6, 7's SSE bug, and 10's API-shape bug; items 13-14 verified by querying the rebuilt Chroma Cloud collection directly and confirming no remaining `[REDACTED_...]` corruption in `Product` fields, plus the full 155-test suite passing.
 
 For the 2026-07-14 hardening pass (semantic cache negation fix, query-rewrite negation-preservation, client-object caching, sticky-refusal-cache fix, multi-item recall, ambiguous-reference expansion) and the 2026-07-15 Cloud Run migration, see git history — this document no longer carries their full detail inline to keep pace with the current architecture, but none of those fixes were reverted or superseded.
 
