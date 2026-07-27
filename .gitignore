@@ -8,10 +8,14 @@ chroma_db
 .venv
 custmor_support_system_main.egg-info
 __pycache__
-data/.ingestion_state.json
-data/.keyword_index.json
+data/landing/*
+!data/landing/.gitkeep
+!data/landing/README.md
 *.pyc
 .python-version
 .terraform
 .terraform.lock.hcl
 .terraform.*
+*.tfstate
+*.tfstate.*
+*.tfvars.local

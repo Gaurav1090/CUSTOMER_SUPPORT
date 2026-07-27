@@ -1,0 +1,40 @@
+name: gcp-build-push
+description: >
+  Build the app image and push it to Artifact Registry, tagged with the
+  commit SHA. Same immutable-tag strategy as the old GKE workflow -- one
+  build feeds every environment (build-once-promote-everywhere).
+
+inputs:
+  region:
+    required: true
+  project_id:
+    required: true
+  repository_id:
+    description: Artifact Registry repository ID (infra/environments/global's artifact_registry_repository_id output).
+    required: true
+  image_name:
+    required: false
+    default: customer-support-rag
+  tag:
+    description: Usually github.sha.
+    required: true
+
+outputs:
+  image:
+    description: Full pushed image reference.
+    value: ${{ steps.build.outputs.image }}
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: gcloud auth configure-docker ${{ inputs.region }}-docker.pkg.dev --quiet
+
+    - id: build
+      shell: bash
+      run: |
+        set -euo pipefail
+        IMAGE="${{ inputs.region }}-docker.pkg.dev/${{ inputs.project_id }}/${{ inputs.repository_id }}/${{ inputs.image_name }}:${{ inputs.tag }}"
+        docker build --tag "$IMAGE" .
+        docker push "$IMAGE"
+        echo "image=$IMAGE" >> "$GITHUB_OUTPUT"

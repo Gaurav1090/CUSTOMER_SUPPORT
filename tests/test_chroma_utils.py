@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -5,8 +6,15 @@ from utils.chroma_utils import create_chroma_store
 
 
 class ChromaStoreTests(unittest.TestCase):
+    @patch.dict("os.environ", {}, clear=False)
     @patch("utils.chroma_utils.Chroma")
     def test_falls_back_to_local_when_cloud_credentials_missing(self, mock_chroma):
+        # This test exercises "auto" mode's fallback specifically, so it
+        # must not inherit a real CHROMA_STORAGE_MODE=cloud from the
+        # process environment (e.g. a local .env loaded by another module
+        # earlier in the same test run/process -- env vars set via
+        # load_dotenv() persist for the rest of the process).
+        os.environ.pop("CHROMA_STORAGE_MODE", None)
         mock_chroma.return_value = MagicMock()
 
         create_chroma_store(

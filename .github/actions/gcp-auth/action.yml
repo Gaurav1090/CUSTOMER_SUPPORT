@@ -1,0 +1,29 @@
+name: gcp-auth
+description: >
+  Authenticate to Google Cloud via Workload Identity Federation (no static
+  keys) and install the gcloud CLI. Shared by the build and deploy reusable
+  workflows so this isn't copy-pasted per environment.
+
+inputs:
+  workload_identity_provider:
+    description: Full WIF provider resource name (infra/environments/global's wif_provider_name output).
+    required: true
+  service_account:
+    description: Email of the service account to impersonate (builder or deployer SA).
+    required: true
+
+outputs:
+  project_id:
+    description: The authenticated project ID.
+    value: ${{ steps.auth.outputs.project_id }}
+
+runs:
+  using: composite
+  steps:
+    - id: auth
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ inputs.workload_identity_provider }}
+        service_account: ${{ inputs.service_account }}
+
+    - uses: google-github-actions/setup-gcloud@v2

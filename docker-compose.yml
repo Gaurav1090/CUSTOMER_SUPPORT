@@ -1,0 +1,30 @@
+services:
+  app:
+    build: .
+    image: customer-support:local
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    # REDIS_URL comes from .env and should point at your cloud Redis
+    # (Memorystore, Redis Cloud, etc.) -- no local redis container here.
+    volumes:
+      # Landing folder, legacy CSV, and (if you're testing the no-cloud-creds
+      # fallback path) the local chroma_db folder all live on the host so
+      # they survive `docker compose down` / image rebuilds.
+      - ./data:/app/data
+      - ./chroma_db:/app/chroma_db
+
+  # Run ingestion on demand against the same volumes as `app`:
+  #   docker compose run --rm ingest
+  # Not started by `docker compose up` -- it's a one-shot job, not a
+  # long-running service.
+  ingest:
+    build: .
+    image: customer-support:local
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./chroma_db:/app/chroma_db
+    entrypoint: ["python", "-m", "data_ingestion.ingestion_pipeline"]
