@@ -115,6 +115,22 @@ flowchart TD
     FEEDBACK --> METRICS["evaluation/product_metrics.py<br/>auto-resolution / exclusion / CSAT,<br/>optionally --by-variant"]
 ```
 
+### 3.1 Architecture diagram (current state, mapped against an enterprise agentic-platform reference)
+
+![Customer Support RAG System — actual architecture, current state](../docs/architecture_current_state.png)
+
+Generated 2026-07-27 by reverse-engineering this document into the same visual
+pattern used by an enterprise agentic-platform reference (ClaimPilot-style:
+clients / edge & access / platform / data & knowledge / cross-cutting columns,
+plus a legend and a key-properties panel). "HAS" badges mark components with a
+real counterpart here (input/output guardrails, PII redaction, eval-gated CI,
+per-call cost tracking); dashed "GAP" boxes mark reference patterns with no
+counterpart in this codebase (planner, tool registry, agent loop, HITL gate,
+async/event spine, OAuth/RBAC, private networking, DR/canary). The honest
+one-line verdict: this is a single-pass RAG pipeline (retrieve → generate →
+judge) with guardrails bracketing the runtime, not an agentic system — the
+diagram is deliberately explicit about that rather than overclaiming.
+
 ### Text version (for a quick skim)
 
 ```

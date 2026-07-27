@@ -74,6 +74,18 @@ Optional: thumbs up/down -> POST /feedback -> Langfuse score on the same
 trace -> evaluation/product_metrics.py aggregates live product metrics
 ```
 
+### Architecture diagram (current state vs. an enterprise agentic-platform reference)
+
+![Customer Support RAG System — actual architecture, current state](docs/architecture_current_state.png)
+
+Reverse-engineered from this document, laid out against the same visual pattern as an
+enterprise agentic-platform reference (ClaimPilot-style: clients / edge / platform /
+data / cross-cutting, with a legend and key-properties panel). Dashed boxes mark
+patterns that reference has but this system doesn't (no agent loop, no tool calling,
+no HITL gate, no async event spine) -- this is a RAG pipeline with guardrails on input
+and output, not an agentic system, and the diagram is explicit about that distinction
+rather than overclaiming.
+
 ## Project structure
 
 ```
